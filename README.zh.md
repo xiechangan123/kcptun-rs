@@ -410,9 +410,26 @@ make release-armv7     # 树莓派 2/3、OpenWrt（二进制约 1.3M）
 make release-arm64     # 树莓派 4/5、AWS Graviton
 make linux             # x86_64 Linux musl（从 macOS 交叉编译）
 make linux-aarch64     # ARM64 Linux musl（从 macOS 交叉编译）
+make windows           # Windows x86_64 .exe（从 macOS/Linux 交叉编译）
 ```
 
 ARM 交叉构建使用 **tokio** 运行时，禁用 `pprof` 以保持二进制最小。
+
+### 从 macOS/Linux 交叉编译 Windows 二进制
+
+使用 mingw-w64（GNU 工具链）交叉编译 `kcptun-client.exe` / `kcptun-server.exe`：
+
+```bash
+rustup target add x86_64-pc-windows-gnu   # 添加 rustup target
+brew install mingw-w64                    # macOS；Debian：apt install gcc-mingw-w64-x86-64
+
+make windows           # 发布构建 → target/x86_64-pc-windows-gnu/release/*.exe
+make build-windows     # 调试构建
+```
+
+Rust 的 `x86_64-pc-windows-gnu` 标准库采用自包含链接，产物 `.exe` 不依赖 `libgcc_s_seh-1.dll` / `libwinpthread-1.dll`，直接复制到 Windows 即可运行。导入表只有系统组件（`kernel32`、`ws2_32`、`advapi32`、`bcrypt`、`ntdll` + UCRT），因此需要 Windows 10 及以上。此处不构建 MSVC 三元组（`x86_64-pc-windows-msvc`），它需要 Windows 主机或 xwin + MSVC SDK。
+
+> Windows 运行时行为未纳入 CI：raw-TCP（`--tcpraw`/`--tcpmux`）需要管理员权限；`--pprof` 可提供 heap/allocs，但 CPU profile 返回 501（kpprof-rs 的 CPU 采样仅支持 Unix）。
 
 ### 系统级 UDP 缓冲区调优（macOS）
 

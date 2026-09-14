@@ -31,6 +31,10 @@
 #   linux-full     - Linux x86_64 + QPP
 #   linux-aarch64-full - Linux aarch64 + QPP
 #
+#   windows        - Windows x86_64 release (mingw-w64 cross, .exe)
+#   build-windows  - Windows x86_64 debug build
+#   release-windows - Windows x86_64 release build
+#
 #   test           - Run all unit tests
 #   stress         - Run stress tests (requires release build)
 #
@@ -152,6 +156,33 @@ LINUX_AARCH64_AR     ?= $(LINUX_AARCH64_PREFIX)-ar
 LINUX_AARCH64_CC     ?= $(LINUX_AARCH64_PREFIX)-gcc
 LINUX_AARCH64_CXX    ?= $(LINUX_AARCH64_PREFIX)-g++
 
+# ---------------------------------------------------------------------------
+# Windows x86_64 (GNU toolchain, mingw-w64) — cross-compiled from macOS/Linux
+# ---------------------------------------------------------------------------
+# Produces kcptun-client.exe / kcptun-server.exe (PE32+). Only the GNU triple
+# is cross-compiled here; x86_64-pc-windows-msvc needs a Windows host (or xwin
+# + the MSVC SDK).
+#
+# Rust's windows-gnu std uses self-contained linking, so the produced .exe has
+# no libgcc_s_seh-1.dll / libwinpthread-1.dll dependency — copy the two .exe
+# files to Windows and run. Verified import table (objdump -p): kernel32,
+# ws2_32, advapi32, bcrypt, ntdll + UCRT (api-ms-win-crt-*), i.e. OS components
+# only (UCRT ships with Windows 10+).
+#
+# Prerequisites:
+#   rustup target add x86_64-pc-windows-gnu
+#   macOS:  brew install mingw-w64
+#   Debian: sudo apt install gcc-mingw-w64-x86-64
+#
+# Note: pprof is Unix-gated (kpprof-rs), so on Windows the --pprof HTTP server
+# serves heap/allocs but /debug/pprof/profile returns 501.
+WINDOWS_TARGET ?= x86_64-pc-windows-gnu
+WINDOWS_PREFIX ?= x86_64-w64-mingw32
+WINDOWS_LINKER ?= $(WINDOWS_PREFIX)-gcc
+WINDOWS_AR     ?= $(WINDOWS_PREFIX)-ar
+WINDOWS_CC     ?= $(WINDOWS_PREFIX)-gcc
+WINDOWS_CXX    ?= $(WINDOWS_PREFIX)-g++
+
 # Environment variables for cross-compilation (avoids modifying .cargo/config.toml).
 # 1) Shell assignment (VAR=value cmd) only allows [A-Za-z0-9_] in VAR, so
 #    CC_armv7-unknown-... is parsed as a command name → "command not found".
@@ -185,6 +216,13 @@ CARGO_TARGET_$(shell echo $(subst -,_,$(LINUX_AARCH64_TARGET)) | tr '[:lower:]' 
 CC_$(subst -,_,$(LINUX_AARCH64_TARGET))=$(LINUX_AARCH64_CC) \
 CXX_$(subst -,_,$(LINUX_AARCH64_TARGET))=$(LINUX_AARCH64_CXX) \
 AR_$(subst -,_,$(LINUX_AARCH64_TARGET))=$(LINUX_AARCH64_AR)
+endef
+
+define windows-env
+CARGO_TARGET_$(shell echo $(subst -,_,$(WINDOWS_TARGET)) | tr '[:lower:]' '[:upper:]')_LINKER=$(WINDOWS_LINKER) \
+CC_$(subst -,_,$(WINDOWS_TARGET))=$(WINDOWS_CC) \
+CXX_$(subst -,_,$(WINDOWS_TARGET))=$(WINDOWS_CXX) \
+AR_$(subst -,_,$(WINDOWS_TARGET))=$(WINDOWS_AR)
 endef
 
 # Fail early with actionable install hints when the selected C compiler is missing.
@@ -226,11 +264,22 @@ define require-linux-aarch64-cc
 	fi
 endef
 
+define require-windows-cc
+	@if ! command -v $(WINDOWS_CC) >/dev/null 2>&1; then \
+		echo "error: C cross-compiler '$(WINDOWS_CC)' not found for $(WINDOWS_TARGET)"; \
+		echo "  macOS:  brew install mingw-w64"; \
+		echo "  Debian: sudo apt install gcc-mingw-w64-x86-64"; \
+		echo "  Then:   make install-cross (adds the rustup target)"; \
+		exit 1; \
+	fi
+endef
+
 .PHONY: all \
 	gate build release \
 	build-armv7 build-armv7-full release-armv7 release-armv7-full \
 	build-arm64 build-arm64-full release-arm64 release-arm64-full \
 	linux linux-aarch64 linux-full linux-aarch64-full \
+	build-windows release-windows windows \
 	test stress e2e check-all \
 	clippy fmt check doc size \
 	bench profile profile-mem profile-go profile-rust-go profiling-bins \
@@ -361,6 +410,32 @@ linux-aarch64-full:
 	@echo "==> Linux aarch64 (+QPP) at target/$(LINUX_AARCH64_TARGET)/release/{kcptun-client,kcptun-server}"
 
 # ---------------------------------------------------------------------------
+# windows — build Windows x86_64 (mingw-w64) from macOS/Linux
+# ---------------------------------------------------------------------------
+# `make windows` == `make release-windows`. No -full variant: the binaries'
+# default features already include qpp + pprof.
+#
+# Prerequisites:
+#   rustup target add x86_64-pc-windows-gnu
+#   macOS:  brew install mingw-w64
+#   Debian: sudo apt install gcc-mingw-w64-x86-64
+# ---------------------------------------------------------------------------
+windows: release-windows
+
+build-windows:
+	$(require-windows-cc)
+	@echo "==> Cross-compiling for $(WINDOWS_TARGET) via $(WINDOWS_CC) (tokio, debug)..."
+	@$(windows-env) $(CARGO) build --workspace --target $(WINDOWS_TARGET) -j $(NUM_JOBS)
+	@echo "==> Binaries at target/$(WINDOWS_TARGET)/debug/{kcptun-client,kcptun-server}.exe"
+
+release-windows:
+	$(require-windows-cc)
+	@echo "==> Cross-compiling for $(WINDOWS_TARGET) via $(WINDOWS_CC) (tokio, release)..."
+	@$(windows-env) $(CARGO) build --workspace --release --target $(WINDOWS_TARGET) -j $(NUM_JOBS)
+	@ls -lh target/$(WINDOWS_TARGET)/release/kcptun-client.exe target/$(WINDOWS_TARGET)/release/kcptun-server.exe || true
+	@echo "==> Windows binaries at target/$(WINDOWS_TARGET)/release/{kcptun-client,kcptun-server}.exe"
+
+# ---------------------------------------------------------------------------
 # install-cross — install cross-compilation Rust toolchains via rustup
 # ---------------------------------------------------------------------------
 # Installs both glibc and musl triples so either auto-detected C toolchain works.
@@ -369,10 +444,12 @@ install-cross:
 	@rustup target add armv7-unknown-linux-gnueabihf armv7-unknown-linux-musleabihf
 	@rustup target add aarch64-unknown-linux-gnu aarch64-unknown-linux-musl
 	@rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+	@rustup target add x86_64-pc-windows-gnu
 	@echo "==> Done. Install a C cross-compiler (Makefile auto-detects which is present):"
-	@echo "    macOS:  brew install filosottile/musl-cross/musl-cross"
-	@echo "    Debian: sudo apt install gcc-arm-linux-gnueabihf gcc-aarch64-linux-gnu"
+	@echo "    macOS:  brew install filosottile/musl-cross/musl-cross mingw-w64"
+	@echo "    Debian: sudo apt install gcc-arm-linux-gnueabihf gcc-aarch64-linux-gnu gcc-mingw-w64-x86-64"
 	@echo "  Detected now: ARMv7=$(ARMV7_TARGET) via $(ARMV7_CC); ARM64=$(ARM64_TARGET) via $(ARM64_CC)"
+	@echo "                Windows=$(WINDOWS_TARGET) via $(WINDOWS_CC)"
 
 # ---------------------------------------------------------------------------
 # targets — list all supported build targets
@@ -405,6 +482,13 @@ targets:
 	@echo "    make linux-aarch64-full — Linux aarch64 (tokio + qpp, musl)"
 	@echo "    (requires musl cross; see: make install-cross)"
 	@echo ""
+	@echo "  Windows (x86_64, mingw-w64; cross-compiles from macOS/Linux):"
+	@echo "    make windows            — Windows x86_64 release (.exe)"
+	@echo "    make build-windows      — Windows x86_64 debug build"
+	@echo "    make release-windows    — Windows x86_64 release build"
+	@echo "    currently: $(WINDOWS_TARGET) via $(WINDOWS_CC)"
+	@echo "    (requires: rustup target add x86_64-pc-windows-gnu + brew install mingw-w64)"
+	@echo ""
 	@echo "  Testing & linting:"
 	@echo "    make test               — unit tests"
 	@echo "    make stress             — stress tests (release)"
@@ -425,10 +509,10 @@ targets:
 	@echo "      go tool pprof -http=:0 http://ADDR/debug/pprof/heap"
 	@echo ""
 	@echo "  Prerequisites for cross-compilation:"
-	@echo "    1. make install-cross   (installs rustup glibc + musl targets)"
+	@echo "    1. make install-cross   (installs rustup glibc + musl + windows-gnu targets)"
 	@echo "    2. Install a C cross-compiler (auto-detected):"
-	@echo "       macOS:  brew install filosottile/musl-cross/musl-cross"
-	@echo "       Debian: sudo apt install gcc-arm-linux-gnueabihf gcc-aarch64-linux-gnu"
+	@echo "       macOS:  brew install filosottile/musl-cross/musl-cross mingw-w64"
+	@echo "       Debian: sudo apt install gcc-arm-linux-gnueabihf gcc-aarch64-linux-gnu gcc-mingw-w64-x86-64"
 
 # ---------------------------------------------------------------------------
 # test / stress / clippy / fmt
@@ -493,7 +577,7 @@ doc:
 size: release
 	@echo "=== Native release (tokio) ==="
 	@ls -lh target/release/kcptun-{client,server} 2>/dev/null || echo "(not built)"
-	@echo "=== ARM (if built) ==="
+	@echo "=== Cross builds (ARM / Linux / Windows, if built) ==="
 	@find target -name 'kcptun-*' -path '*release*' -not -name '*.d' -exec ls -lh {} + 2>/dev/null | head -20 || true
 
 bench: release

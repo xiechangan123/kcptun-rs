@@ -45,7 +45,7 @@ Feature cascade: binary `tokio` ⇒ `kcptun-common/tokio` ⇒ `kcp-rs/async` + `
 | File | Description |
 |------|-------------|
 | `Cargo.toml` | Workspace root; release: `opt-level=3`, LTO, `panic=abort`, strip; `profiling` profile |
-| `Makefile` | `build/release/test/stress/e2e/clippy/fmt/gate/bench/profile*/release-armv7/release-arm64/check-deps` |
+| `Makefile` | `build/release/test/stress/e2e/clippy/fmt/gate/bench/profile*/release-armv7/release-arm64/windows/check-deps` |
 | `test_e2e.sh` | Go↔Rust interop matrix (needs Go bins in `tests/kcptun-go/`) |
 | `publish_crates.sh` | crates.io release entrypoint; dry-run default, `--execute` uploads |
 | `bench_rust_vs_go.py` / `bench_results.json` | Throughput harness + latest numbers |
@@ -64,6 +64,7 @@ make clippy                   # -D warnings (kcptun-server/tests currently carri
 make fmt
 make bench / profile / profile-rust-go / profiling-bins
 make release-armv7 / release-arm64
+make windows                  # x86_64-pc-windows-gnu via mingw-w64 (from macOS/Linux; --tcpraw needs Admin on Windows)
 ./publish_crates.sh [--execute]
 ```
 

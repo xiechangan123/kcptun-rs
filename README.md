@@ -411,9 +411,26 @@ make release-armv7     # Raspberry Pi 2/3, OpenWrt (~1.3M binary)
 make release-arm64     # Raspberry Pi 4/5, AWS Graviton
 make linux             # x86_64 Linux musl (from macOS)
 make linux-aarch64     # ARM64 Linux musl (from macOS)
+make windows           # Windows x86_64 .exe (from macOS/Linux)
 ```
 
 ARM cross builds use the **tokio** runtime with `pprof` disabled for minimal binary size.
+
+### Windows Binaries from macOS/Linux
+
+Cross-compile `kcptun-client.exe` / `kcptun-server.exe` with the mingw-w64 GNU toolchain:
+
+```bash
+rustup target add x86_64-pc-windows-gnu   # rustup target
+brew install mingw-w64                    # macOS; Debian: apt install gcc-mingw-w64-x86-64
+
+make windows           # release build → target/x86_64-pc-windows-gnu/release/*.exe
+make build-windows     # debug build
+```
+
+Rust's `x86_64-pc-windows-gnu` std uses self-contained linking, so the `.exe` files carry no `libgcc_s_seh-1.dll` / `libwinpthread-1.dll` dependency — copy them to Windows and run. The only imports are OS components (`kernel32`, `ws2_32`, `advapi32`, `bcrypt`, `ntdll` + UCRT), so Windows 10 or newer is required. The MSVC triple (`x86_64-pc-windows-msvc`) is not built here; it requires a Windows host or xwin plus the MSVC SDK.
+
+> Windows runtime behavior is not covered by CI: raw-TCP (`--tcpraw`/`--tcpmux`) needs Administrator privileges, and `--pprof` serves heap/allocs but returns 501 for CPU profiles (kpprof-rs CPU sampling is Unix-only).
 
 ### Linux Binaries from macOS
 
