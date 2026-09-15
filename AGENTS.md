@@ -103,6 +103,16 @@ server: shared UDP → KcptunListener demux (workers) / raw TCP per-peer → Kcp
 
 Snappy is **session-level**, on by default (`--nocomp` disables). `--key`, `--crypt`, `--mode`, `--nocomp` must match client and server.
 
+**Session lifecycle (client pool).** `--autoexpire` replaces a pool slot when a
+new TCP connection lands on it after `creation + autoexpire`. The replaced
+session is **retired, not killed**: it leaves the pool, stays on the scavenger
+list, and keeps serving its streams; the scavenger closes it once
+`creation + autoexpire + --scavengettl` has passed **and** it has no streams
+left (`client::should_retire_session`). A session is closed as dead only when
+its own liveness rules say so (KCP dead/closed, SMUX keepalive timeout, inbound
+silence that we are not causing ourselves, or stalled ACK progress). Deleting
+the retirement path aborts in-flight downloads whenever a slot is replaced.
+
 ## For AI Agents
 
 ### Rules
@@ -116,7 +126,13 @@ Snappy is **session-level**, on by default (`--nocomp` disables). `--key`, `--cr
 ### Testing
 
 - `cargo test --workspace` / `make test`; kcp-rs integration tests need `--features async` (or `--all-features`).
-- Clippy gate: `make clippy` (`-D warnings`). Known pre-existing debt: `kcptun-server/tests/stress_test.rs` (21 lints) and `test_fast_retransmit_fires_on_duplicate_acks` (fails on current branch, user WIP).
+- `cargo test --release -p kcptun-server --test session_retirement_test -- --nocapture` — asserts the
+  three-phase autoexpire lifecycle (retired session keeps serving → new connection uses the new
+  session → old session closed only after it finished).
+- Tests that spawn binaries resolve them through `find_bin`, which prefers an existing
+  `target/release` build — `cargo build --release -p kcptun-client -p kcptun-server` first, or a
+  stale binary silently tests old code (`reconnect_test.rs` has a freshness guard, the others do not).
+- Clippy gate: `make clippy` (`-D warnings`). Known pre-existing debt: `kcptun-server/tests/stress_test.rs` (21 lints). `test_fast_retransmit_fires_on_duplicate_acks` passes as of 2026-09-15.
 - **E2E requires explicit user confirmation.** Never start `test_e2e.sh` / `make e2e` proactively; recommend it and ask.
 - `make stress` after flush/lock/session changes.
 
