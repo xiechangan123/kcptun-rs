@@ -671,6 +671,16 @@ impl KcpStream {
         self.shared.wait_send.load(Ordering::Relaxed)
     }
 
+    /// Sequence number of the oldest outbound segment the peer has not ACKed.
+    ///
+    /// Polled together with [`KcpStream::wait_send`]: a frozen value while data
+    /// is in flight means the peer is no longer acknowledging our segments
+    /// (its KCP state was reset), which `dead_link` only notices after its
+    /// full retransmission budget.
+    pub fn snd_una(&self) -> u32 {
+        self.shared.kcp.lock().snd_una()
+    }
+
     /// Whether KCP has declared the link dead (retransmission budget spent).
     ///
     /// The background flush loop keeps running after this; callers (the
@@ -1630,8 +1640,10 @@ mod integ {
         let conn = conn_with_transport(transport).await;
         assert!(!conn.is_closed());
 
-        conn.shared
-            .note_io_error(io::Error::new(io::ErrorKind::ConnectionRefused, "peer down"));
+        conn.shared.note_io_error(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "peer down",
+        ));
         assert!(conn.is_closed());
         assert!(conn.is_dead() || conn.is_closed());
     }

@@ -13,7 +13,66 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Newest modification time among the `src/` trees of the workspace crates
+/// under `root`.
+fn newest_source_mtime(root: &std::path::Path) -> Option<std::time::SystemTime> {
+    fn scan(dir: &std::path::Path, newest: &mut Option<std::time::SystemTime>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                scan(&path, newest);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                if let Ok(t) = entry.metadata().and_then(|m| m.modified()) {
+                    if newest.is_none_or(|cur| t > cur) {
+                        *newest = Some(t);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut newest = None;
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        if !path.is_dir() || name.to_string_lossy().starts_with('.') || name == "target" {
+            continue;
+        }
+        let src = path.join("src");
+        if src.is_dir() {
+            scan(&src, &mut newest);
+        }
+    }
+    newest
+}
+
+/// True when `path` is at least as new as the workspace sources it should have
+/// been built from (or when that cannot be determined).
+fn binary_is_fresh(path: &str) -> bool {
+    let bin_time = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    // <root>/target/<profile>/<bin>: the workspace root is three levels up.
+    let root = std::path::Path::new(path)
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent());
+    let Some((bin_time, src_time)) = bin_time.zip(root.and_then(newest_source_mtime)) else {
+        return true;
+    };
+    bin_time >= src_time
+}
+
+/// Resolve a workspace binary.
+///
+/// `cargo test -p kcptun-server` does NOT rebuild the kcptun-client binary, so
+/// an existing-but-stale `target/release/kcptun-client` would silently put
+/// pre-change code under test (this hid a client compile error once). Prefer
+/// the first candidate that is newer than the sources; if every candidate is
+/// stale, say so loudly and use it anyway.
 fn find_bin(name: &str) -> String {
+    let mut first_existing = None;
     for dir in &[
         "target/release",
         "target/debug",
@@ -21,11 +80,25 @@ fn find_bin(name: &str) -> String {
         "../target/debug",
     ] {
         let path = format!("{}/{}", dir, name);
-        if std::path::Path::new(&path).exists() {
+        if !std::path::Path::new(&path).exists() {
+            continue;
+        }
+        if binary_is_fresh(&path) {
             return path;
         }
+        first_existing.get_or_insert(path);
     }
-    name.to_string()
+    match first_existing {
+        Some(stale) => {
+            eprintln!(
+                "WARNING: {stale} is older than the workspace sources it should have been \
+                 built from — this run may be testing stale code. Run `make release` (or \
+                 `cargo build --release`) first."
+            );
+            stale
+        }
+        None => name.to_string(),
+    }
 }
 
 fn kill_port(port: u16) {
@@ -42,7 +115,6 @@ struct ReconnectEnv {
     target_port: u16,
     crypt: String,
     nocomp: bool,
-    conn: usize,
     keepalive: u64,
     mode: String,
 }
@@ -156,7 +228,6 @@ impl ReconnectEnv {
             target_port,
             crypt: crypt.to_string(),
             nocomp,
-            conn,
             keepalive,
             mode: mode.to_string(),
         }
@@ -262,60 +333,6 @@ impl ReconnectEnv {
                 Err(e) => println!("  client wait err: {e}"),
             }
         }
-    }
-
-    fn kill_client(&mut self) {
-        if self.procs.len() > 2 {
-            let _ = self.procs[2].kill();
-            let _ = self.procs[2].wait();
-        }
-    }
-
-    fn restart_client(&mut self) {
-        self.kill_client();
-        kill_port(self.cli_port);
-        thread::sleep(Duration::from_millis(500));
-
-        let mut cli_args: Vec<String> = vec![
-            "-r".into(),
-            format!("127.0.0.1:{}", self.srv_port),
-            "-l".into(),
-            format!(":{}", self.cli_port),
-            "--key".into(),
-            "k".into(),
-            "--crypt".into(),
-            self.crypt.clone(),
-            "--mode".into(),
-            self.mode.clone(),
-            "--datashard".into(),
-            "0".into(),
-            "--parityshard".into(),
-            "0".into(),
-            "--sndwnd".into(),
-            "2048".into(),
-            "--rcvwnd".into(),
-            "2048".into(),
-            "--keepalive".into(),
-            self.keepalive.to_string(),
-            "--conn".into(),
-            self.conn.to_string(),
-        ];
-        if self.nocomp {
-            cli_args.push("--nocomp".into());
-        }
-
-        let cl = Command::new(&find_bin("kcptun-client"))
-            .args(&cli_args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("cli restart");
-        if self.procs.len() > 2 {
-            self.procs[2] = cl;
-        } else {
-            self.procs.push(cl);
-        }
-        thread::sleep(Duration::from_secs(2));
     }
 }
 

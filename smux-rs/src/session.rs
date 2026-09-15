@@ -684,25 +684,6 @@ impl Session {
         self.streams.lock().len()
     }
 
-    /// Count streams that have written outbound bytes, never read a reply,
-    /// and are at least `min_age_ms` old. Used to catch the post-server-
-    /// restart blackhole (KCP/FEC still move packets, streams never complete).
-    pub fn unanswered_write_count(&self, min_age_ms: u64) -> usize {
-        self.streams
-            .lock()
-            .values()
-            .filter(|s| s.is_unanswered_write(min_age_ms))
-            .count()
-    }
-
-    /// True when the session looks desynchronized: two or more streams have
-    /// been waiting on a reply for `fast_ms`, or a single stream has waited
-    /// for `slow_ms`. A lone slow backend (first byte after a few seconds)
-    /// must not tear down an otherwise healthy session.
-    pub fn has_blackhole_writes(&self, fast_ms: u64, slow_ms: u64) -> bool {
-        self.unanswered_write_count(fast_ms) >= 2 || self.unanswered_write_count(slow_ms) >= 1
-    }
-
     /// Perform keepalive check — returns true if a ping should be sent.
     ///
     /// `keepalive_interval == 0` means keepalives are disabled (`Config::verify`

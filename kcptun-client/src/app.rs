@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use log::{error, info};
+use log::{debug, error, info};
 
 use crate::cli::{Cli, Config};
 use crate::client::{self, ClientDialOptions};
@@ -482,9 +482,9 @@ pub(crate) async fn async_main() -> Result<()> {
                 info!("accepted connection from {} (stream {})", peer, stream_id);
             }
 
-            let (flush_notify_ref, session_ref) = {
+            let flush_notify_ref = {
                 let guard = conns.lock();
-                (guard[idx].flush_notify(), Some(guard[idx].clone()))
+                guard[idx].flush_notify()
             };
 
             let qpp_key = key.to_vec();
@@ -492,7 +492,6 @@ pub(crate) async fn async_main() -> Result<()> {
                 if let Err(e) = client::handle_client(
                     local,
                     smux_stream,
-                    session_ref,
                     qpp_enabled,
                     qpp_key,
                     qpp_count,

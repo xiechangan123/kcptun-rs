@@ -1,7 +1,9 @@
 //! End-to-end tests for the server **listen** / client **connect** path:
 //! [`KcpListener`] multi-peer accept + [`KcpConn::connect`] dial.
 //!
-//! Run on their own with either runtime backend:
+//! NOTE: gated on `async-tokio`/`async-smol`, which no longer exist as kcp-rs
+//! features — this whole target currently compiles to nothing. Reviving it
+//! needs the `kio` → `knet` rename plus API drift fixes.
 //!
 //! ```text
 //! cargo test -p kcp-rs --features async-tokio --test kcpconn_listener
@@ -306,9 +308,41 @@ fn connect_timeout_live_listener_succeeds() {
 }
 
 /// `connect_timeout` fails with `TimedOut` (after roughly the full timeout)
-/// when nothing responds — UDP has no RST-style fast failure.
+/// when the peer socket is alive but never answers — the probe is
+/// retransmitted until the deadline, so there is no fast failure.
 #[test]
-fn connect_timeout_dead_port_times_out() {
+fn connect_timeout_unresponsive_peer_times_out() {
+    kio::block_on(async {
+        // A bound-but-silent peer: packets are accepted by the kernel, nothing
+        // ever replies (and no ICMP port-unreachable is generated).
+        let silent = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let addr = silent.local_addr().unwrap();
+
+        let start = std::time::Instant::now();
+        let err = match KcpConn::connect(addr)
+            .conv(CONV)
+            .connect_timeout(Duration::from_millis(300))
+            .build()
+            .await
+        {
+            Ok(_) => panic!("connect to an unresponsive peer should time out"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            start.elapsed() >= Duration::from_millis(280),
+            "should wait roughly the full timeout before failing"
+        );
+        drop(silent);
+    });
+}
+
+/// A closed port answers with an ICMP port-unreachable, which closes the
+/// connection: `connect_timeout` fails *before* its deadline instead of
+/// waiting it out. This is the signal a client redial relies on after a
+/// server restart.
+#[test]
+fn connect_to_closed_port_fails_before_timeout() {
     kio::block_on(async {
         // Grab an ephemeral port then release it: nothing listens there.
         let probe = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
@@ -318,17 +352,17 @@ fn connect_timeout_dead_port_times_out() {
         let start = std::time::Instant::now();
         let err = match KcpConn::connect(dead)
             .conv(CONV)
-            .connect_timeout(Duration::from_millis(300))
+            .connect_timeout(Duration::from_secs(2))
             .build()
             .await
         {
-            Ok(_) => panic!("connect to a dead port should time out"),
+            Ok(_) => panic!("connect to a closed port should fail"),
             Err(e) => e,
         };
-        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(err.kind(), std::io::ErrorKind::NotConnected);
         assert!(
-            start.elapsed() >= Duration::from_millis(280),
-            "should wait roughly the full timeout before failing"
+            start.elapsed() < Duration::from_secs(1),
+            "closed port must fail fast, not wait for the connect deadline"
         );
     });
 }

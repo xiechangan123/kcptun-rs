@@ -193,9 +193,6 @@ pub struct Stream {
     flush_notify: Mutex<Option<Arc<knet::Notify>>>,
     /// Weak self-reference so a grace-expiry wakeup task can re-wake a reader.
     self_ref: Mutex<Option<std::sync::Weak<Stream>>>,
-    /// When the stream was created — used to detect unanswered writes after
-    /// a peer restart (session looks alive but streams never get a reply).
-    opened_at: Instant,
 }
 
 impl Stream {
@@ -235,7 +232,6 @@ impl Stream {
             ch_write_wakeup: knet::Notify::new(),
             flush_notify: Mutex::new(None),
             self_ref: Mutex::new(None),
-            opened_at: Instant::now(),
         }
     }
 
@@ -646,33 +642,6 @@ impl Stream {
     #[inline]
     pub fn pending_send(&self) -> usize {
         self.send_buf_bytes.load(Ordering::Relaxed)
-    }
-
-    /// Bytes the application has read from this stream.
-    #[inline]
-    pub fn bytes_read(&self) -> u32 {
-        self.bytes_read.load(Ordering::Acquire)
-    }
-
-    /// Bytes the application has written into this stream (accepted by the
-    /// local send buffer / handed to the transport).
-    #[inline]
-    pub fn bytes_written(&self) -> u32 {
-        self.bytes_written.load(Ordering::Acquire)
-    }
-
-    /// Milliseconds since the stream was created.
-    #[inline]
-    pub fn age_ms(&self) -> u64 {
-        self.opened_at.elapsed().as_millis() as u64
-    }
-
-    /// True when this stream has written outbound bytes but never read a
-    /// reply — the post-restart blackhole pattern (KCP/FEC still move
-    /// packets locally so `pending_send` drains to 0, but the peer never
-    /// answers this stream).
-    pub fn is_unanswered_write(&self, min_age_ms: u64) -> bool {
-        self.bytes_written() > 0 && self.bytes_read() == 0 && self.age_ms() >= min_age_ms
     }
 
     /// Mark remote side closed (FIN received).

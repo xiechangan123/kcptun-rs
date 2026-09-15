@@ -1,3 +1,5 @@
+// NOTE: gated on `async-tokio`, which no longer exists as a kcp-rs feature —
+// this target compiles to nothing (same drift as kcpconn_listener.rs).
 #![cfg(feature = "async-tokio")]
 
 use kcp_rs::{KcpConfig, KcpConn, KcpMode, KcpTcpListener};

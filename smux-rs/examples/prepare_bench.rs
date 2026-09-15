@@ -6,7 +6,7 @@
 //! Usage:
 //!   cargo run --release -p smux-rs --example prepare_bench -- [streams] [iters]
 
-use bytes::{BytesMut};
+use bytes::BytesMut;
 use smux_rs::{Config, Session, DEFAULT_CONFIG};
 
 fn main() {

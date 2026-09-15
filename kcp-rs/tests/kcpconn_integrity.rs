@@ -1,6 +1,8 @@
 //! End-to-end data-integrity tests for the async [`KcpConn`] (`feature = "async"`).
 //!
-//! Run on their own with either runtime backend:
+//! NOTE: gated on `async-tokio`/`async-smol`, which no longer exist as kcp-rs
+//! features — this whole target currently compiles to nothing. Reviving it
+//! needs the `kio` → `knet` rename plus API drift fixes.
 //!
 //! ```text
 //! cargo test -p kcp-rs --features async-tokio --test kcpconn_integrity
@@ -517,14 +519,22 @@ fn kcpconn_readable_timeout() {
 
 /// A full send window produces a bounded write timeout even though the flush
 /// loop continues to wake periodically while the peer is silent.
+///
+/// The peer is a live UDP socket that never reads: sends succeed at the kernel
+/// (no ICMP port-unreachable), so the connection stays open and only KCP
+/// backpressure applies. A closed port would instead be a fatal peer-down
+/// error and close the connection before the write timeout can fire.
 #[test]
 fn kcpconn_write_shared_timeout() {
     kio::block_on(async {
-        let probe = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        let dead = probe.local_addr().unwrap();
-        drop(probe);
+        let blackhole = kio::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let silent_peer = blackhole.local_addr().unwrap();
 
-        let conn = KcpConn::connect(dead).sndwnd(1).build().await.unwrap();
+        let conn = KcpConn::connect(silent_peer)
+            .sndwnd(1)
+            .build()
+            .await
+            .unwrap();
         conn.set_write_timeout(Some(Duration::from_millis(80)))
             .unwrap();
         conn.write_all_shared(&[1u8; 1200]).await.unwrap();
@@ -533,6 +543,8 @@ fn kcpconn_write_shared_timeout() {
             .expect("write_shared must not outlive its configured timeout");
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
         conn.close();
+        // Keep the black-hole peer alive until the connection is fully closed.
+        drop(blackhole);
     });
 }
 

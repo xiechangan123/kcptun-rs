@@ -262,9 +262,41 @@ fn connect_timeout_live_listener_succeeds() {
 }
 
 /// `connect_timeout` fails with `TimedOut` (after roughly the full timeout)
-/// when nothing responds — UDP has no RST-style fast failure.
+/// when the peer socket is alive but never answers — the probe is
+/// retransmitted until the deadline, so there is no fast failure.
 #[test]
-fn connect_timeout_dead_port_times_out() {
+fn connect_timeout_unresponsive_peer_times_out() {
+    knet::block_on(async {
+        // A bound-but-silent peer: packets are accepted by the kernel, nothing
+        // ever replies (and no ICMP port-unreachable is generated).
+        let silent = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let addr = silent.local_addr().unwrap();
+
+        let start = std::time::Instant::now();
+        let err = match KcpStream::connect(addr)
+            .conv(CONV)
+            .connect_timeout(Duration::from_millis(300))
+            .build()
+            .await
+        {
+            Ok(_) => panic!("connect to an unresponsive peer should time out"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            start.elapsed() >= Duration::from_millis(280),
+            "should wait roughly the full timeout before failing"
+        );
+        drop(silent);
+    });
+}
+
+/// A closed port answers with an ICMP port-unreachable, which closes the
+/// connection: `connect_timeout` fails *before* its deadline instead of
+/// waiting it out. This is the signal a client redial relies on after a
+/// server restart.
+#[test]
+fn connect_to_closed_port_fails_before_timeout() {
     knet::block_on(async {
         // Grab an ephemeral port then release it: nothing listens there.
         let probe = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
@@ -274,17 +306,17 @@ fn connect_timeout_dead_port_times_out() {
         let start = std::time::Instant::now();
         let err = match KcpStream::connect(dead)
             .conv(CONV)
-            .connect_timeout(Duration::from_millis(300))
+            .connect_timeout(Duration::from_secs(2))
             .build()
             .await
         {
-            Ok(_) => panic!("connect to a dead port should time out"),
+            Ok(_) => panic!("connect to a closed port should fail"),
             Err(e) => e,
         };
-        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(err.kind(), std::io::ErrorKind::NotConnected);
         assert!(
-            start.elapsed() >= Duration::from_millis(280),
-            "should wait roughly the full timeout before failing"
+            start.elapsed() < Duration::from_secs(1),
+            "closed port must fail fast, not wait for the connect deadline"
         );
     });
 }

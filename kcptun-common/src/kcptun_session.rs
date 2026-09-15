@@ -36,11 +36,6 @@ pub struct KcptunSession {
     /// `kcp.last_activity_ms`, which is also stamped on writes — after a
     /// server restart the writer keeps stamping while the peer is gone.
     last_inbound_ms: Arc<std::sync::atomic::AtomicU64>,
-    /// Consecutive local streams that transferred outbound bytes but never
-    /// received a response. After a server restart with FEC, the session can
-    /// keep exchanging (or appearing to exchange) packets while every new
-    /// stream is a black hole — dead_link/keepalive never fire.
-    stream_fails: Arc<std::sync::atomic::AtomicU32>,
     _handles: Vec<knet::JoinHandle<()>>,
 }
 
@@ -143,7 +138,6 @@ impl KcptunSession {
         let compressor = Arc::new(Mutex::new(snap::write::FrameEncoder::new(Vec::new())));
         let limiter = Arc::new(RateLimiter::new(rate_limit));
         let last_inbound_ms = Arc::new(std::sync::atomic::AtomicU64::new(knet::mono_ms()));
-        let stream_fails = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let handles = vec![
             knet::spawn_task(read_loop(
                 kcp.clone(),
@@ -181,7 +175,6 @@ impl KcptunSession {
             dead,
             created_ms: knet::mono_ms(),
             last_inbound_ms,
-            stream_fails,
             _handles: handles,
         };
         kcp_rs::DEFAULT_SNMP.session_opened(active_open);
@@ -264,29 +257,6 @@ impl KcptunSession {
         knet::mono_ms().saturating_sub(self.last_inbound_ms.load(Ordering::Acquire))
     }
 
-    /// Record a stream that sent data but never received a reply.
-    ///
-    /// After a server restart the old session can look alive (KCP/FEC
-    /// packets still flow) while every new SMUX stream is a black hole.
-    /// Three consecutive silent streams force a close so the accept-loop
-    /// redials, matching a client process restart.
-    pub fn note_stream_blackhole(&self) {
-        const FAIL_LIMIT: u32 = 3;
-        let fails = self.stream_fails.fetch_add(1, Ordering::Relaxed) + 1;
-        if fails >= FAIL_LIMIT {
-            log::warn!(
-                "session marked dead: {} consecutive streams sent data with no reply",
-                fails
-            );
-            self.close();
-        }
-    }
-
-    /// Record a stream that received a reply — clears the blackhole streak.
-    pub fn note_stream_alive(&self) {
-        self.stream_fails.store(0, Ordering::Relaxed);
-    }
-
     /// Close KCP, SMUX, and all streams.
     pub fn close(&self) {
         self.dead.store(true, Ordering::Release);
@@ -356,33 +326,166 @@ async fn read_loop(
     kcp.close();
 }
 
+/// How long outbound data may stay unacknowledged before the session is
+/// declared dead, provided the peer is still sending us traffic.
+///
+/// A restarted peer brings up a fresh KCP state: it drops our segments as
+/// out-of-window without ACKing them, so `snd_una` never advances even though
+/// its own ACKs/probes keep arriving and the SMUX keepalive stays satisfied.
+/// `dead_link` only notices after its full retransmission budget (~20
+/// retransmits with RTO backoff) and the idle timeout needs 30 s of complete
+/// silence, so neither recovers a stale session in time.
+const ACK_STALL_MS: u64 = 10_000;
+
+/// A stall only counts while the peer is still reachable. During a plain
+/// network outage both directions go quiet at once; there KCP's own
+/// retransmission is the correct recovery and the session must be left alone.
+const ACK_STALL_INBOUND_FRESH_MS: u64 = 5_000;
+
+/// Tracks whether the peer keeps acknowledging outbound data.
+///
+/// The clock starts when data is in flight and nothing new gets acknowledged,
+/// and keeps running across inbound gaps (peer traffic is bursty). It only
+/// reports a stall once the peer has also been heard from recently.
+struct AckStallDetector {
+    last_una: u32,
+    stalled_since: Option<u64>,
+}
+
+impl AckStallDetector {
+    fn new(una: u32) -> Self {
+        Self {
+            last_una: una,
+            stalled_since: None,
+        }
+    }
+
+    /// How long the current stall has been running (diagnostics).
+    fn stalled_ms(&self, now_ms: u64) -> Option<u64> {
+        self.stalled_since.map(|since| now_ms.saturating_sub(since))
+    }
+
+    /// Feed one sample (roughly every 500 ms); true means the session should
+    /// be declared dead.
+    fn sample(&mut self, now_ms: u64, waiting: bool, una: u32, inbound_age_ms: u64) -> bool {
+        if !waiting || una != self.last_una {
+            self.stalled_since = None;
+        } else if self.stalled_since.is_none() {
+            self.stalled_since = Some(now_ms);
+        }
+        self.last_una = una;
+        self.stalled_since.is_some_and(|since| {
+            now_ms.saturating_sub(since) >= ACK_STALL_MS
+                && inbound_age_ms < ACK_STALL_INBOUND_FRESH_MS
+        })
+    }
+}
+
+#[cfg(test)]
+mod ack_stall_tests {
+    use super::{AckStallDetector, ACK_STALL_INBOUND_FRESH_MS, ACK_STALL_MS};
+
+    /// Samples arrive every 500 ms in production; the peer is reachable.
+    const FRESH: u64 = 200;
+
+    #[test]
+    fn fires_after_the_stall_window() {
+        let mut det = AckStallDetector::new(7);
+        let mut now = 0;
+        while now < ACK_STALL_MS {
+            assert!(!det.sample(now, true, 7, FRESH), "fired early at {now}ms");
+            now += 500;
+        }
+        assert!(det.sample(ACK_STALL_MS, true, 7, FRESH));
+    }
+
+    #[test]
+    fn outage_between_peer_and_us_does_not_fire() {
+        // Data in flight but the peer stopped talking to us as well: that is a
+        // link outage, which KCP retransmission is meant to ride out. The
+        // inbound age grows with the outage, so the reachability check fails
+        // even after the stall window has elapsed.
+        let mut det = AckStallDetector::new(7);
+        assert!(!det.sample(0, true, 7, 100));
+        assert!(!det.sample(5_000, true, 7, 5_100));
+        assert!(!det.sample(ACK_STALL_MS, true, 7, 10_100));
+        assert!(!det.sample(20_000, true, 7, 20_100));
+    }
+
+    #[test]
+    fn acknowledgement_progress_restarts_the_clock() {
+        let mut det = AckStallDetector::new(7);
+        for now in (0..6_000).step_by(500) {
+            assert!(!det.sample(now, true, 7, FRESH), "fired early at {now}ms");
+        }
+        // Peer acknowledged more data: the window starts over from here.
+        assert!(!det.sample(6_000, true, 8, FRESH));
+        let mut now = 6_500;
+        while now < 16_500 {
+            assert!(!det.sample(now, true, 8, FRESH), "fired early at {now}ms");
+            now += 500;
+        }
+        assert!(det.sample(16_500, true, 8, FRESH));
+    }
+
+    #[test]
+    fn nothing_in_flight_never_fires() {
+        let mut det = AckStallDetector::new(7);
+        assert!(!det.sample(0, false, 7, FRESH));
+        assert!(!det.sample(600_000, false, 7, FRESH));
+    }
+
+    #[test]
+    fn fresh_inbound_bound_is_shorter_than_the_stall_window() {
+        // The reachability probe must be able to discriminate a live peer
+        // before the stall window elapses, otherwise the rule is dead code.
+        assert!(ACK_STALL_INBOUND_FRESH_MS < ACK_STALL_MS);
+    }
+}
+
 /// Force-close the session when the peer has gone silent, independently of
 /// the write path (which can block on a full send window after a server
-/// restart). Also closes when streams have unanswered writes — the FEC
-/// desync case keeps KCP packets flowing while every stream is a blackhole.
+/// restart), and when it keeps talking but has stopped acknowledging our data.
+///
+/// Deliberately ignores stream-level progress: a stream that has written but
+/// not yet been answered is indistinguishable from a healthy request against
+/// a slow backend, so treating it as death tears down working sessions.
+/// Link death is judged only by transport state: KCP dead/closed, SMUX
+/// keepalive timeout, inbound silence, and stalled ACK progress.
 async fn watchdog_loop(
     kcp: Arc<kcp_rs::KcpStream>,
     smux: Arc<smux_rs::Session>,
     dead: Arc<AtomicBool>,
     last_inbound_ms: Arc<std::sync::atomic::AtomicU64>,
 ) {
+    let mut ack_stall = AckStallDetector::new(kcp.snd_una());
     while !dead.load(Ordering::Acquire) && !smux.is_closed() && !kcp.is_closed() {
         knet::sleep_ms(500).await;
+        let now = knet::mono_ms();
         let timeout = smux.keepalive_timeout_secs();
-        let timed_out = timeout > 0
-            && knet::mono_ms().saturating_sub(last_inbound_ms.load(Ordering::Acquire))
-                >= timeout.saturating_mul(1000);
-        // 2+ streams stuck ≥3s, or 1 stream stuck ≥15s = desynchronized session
-        // (typically after the server restarted with FEC still enabled).
-        // A single slow stream must not tear down a healthy session.
-        let blackhole = smux.has_blackhole_writes(3_000, 15_000);
-        if kcp.is_dead() || smux.is_keepalive_timeout() || timed_out || blackhole {
+        let inbound_age = now.saturating_sub(last_inbound_ms.load(Ordering::Acquire));
+        let timed_out = timeout > 0 && inbound_age >= timeout.saturating_mul(1000);
+
+        let una = kcp.snd_una();
+        let waiting = kcp.wait_send() > 0;
+        let ack_stalled = ack_stall.sample(now, waiting, una, inbound_age);
+        if log::log_enabled!(log::Level::Debug) {
+            // Only while acknowledgements are actually behind — a bulk transfer
+            // keeps data in flight constantly and must not log every tick.
+            if let Some(stalled) = ack_stall.stalled_ms(now) {
+                log::debug!(
+                    "session watchdog: no ack progress for {stalled}ms (snd_una={una}, wait_send={}, inbound_age={inbound_age}ms)",
+                    kcp.wait_send()
+                );
+            }
+        }
+
+        let kcp_dead = kcp.is_dead();
+        let smux_timeout = smux.is_keepalive_timeout();
+        if kcp_dead || smux_timeout || timed_out || ack_stalled {
             log::warn!(
-                "session watchdog: closing (kcp_dead={}, smux_timeout={}, inbound_idle={}, blackhole={})",
-                kcp.is_dead(),
-                smux.is_keepalive_timeout(),
-                timed_out,
-                blackhole
+                "session watchdog: closing (kcp_dead={kcp_dead}, smux_timeout={smux_timeout}, inbound_idle={timed_out}, ack_stalled={ack_stalled}, snd_una={una}, wait_send={})",
+                kcp.wait_send()
             );
             dead.store(true, Ordering::Release);
             smux.close();

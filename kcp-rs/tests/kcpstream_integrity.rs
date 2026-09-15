@@ -515,14 +515,22 @@ fn kcpstream_readable_timeout() {
 
 /// A full send window produces a bounded write timeout even though the flush
 /// loop continues to wake periodically while the peer is silent.
+///
+/// The peer is a live UDP socket that never reads: sends succeed at the kernel
+/// (no ICMP port-unreachable), so the connection stays open and only KCP
+/// backpressure applies. A closed port would instead be a fatal peer-down
+/// error and close the connection before the write timeout can fire.
 #[test]
 fn kcpstream_write_shared_timeout() {
     knet::block_on(async {
-        let probe = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        let dead = probe.local_addr().unwrap();
-        drop(probe);
+        let blackhole = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let silent_peer = blackhole.local_addr().unwrap();
 
-        let conn = KcpStream::connect(dead).sndwnd(1).build().await.unwrap();
+        let conn = KcpStream::connect(silent_peer)
+            .sndwnd(1)
+            .build()
+            .await
+            .unwrap();
         conn.set_write_timeout(Some(Duration::from_millis(80)))
             .unwrap();
         conn.write_all(&[1u8; 1200]).await.unwrap();
@@ -531,6 +539,8 @@ fn kcpstream_write_shared_timeout() {
             .expect("write_shared must not outlive its configured timeout");
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
         conn.close();
+        // Keep the black-hole peer alive until the connection is fully closed.
+        drop(blackhole);
     });
 }
 

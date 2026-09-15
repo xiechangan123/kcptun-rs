@@ -129,7 +129,6 @@ pub(crate) fn is_creation_scavenge_expired_at(
 pub(crate) async fn handle_client(
     local: knet::TcpStream,
     smux_stream: Arc<smux_rs::stream::Stream>,
-    session: Option<SessionRef>,
     qpp_enabled: bool,
     qpp_key: Vec<u8>,
     qpp_count: u16,
@@ -175,16 +174,6 @@ pub(crate) async fn handle_client(
 
     match pipe_result {
         Ok((a, b)) => {
-            // Sent into the tunnel but never got a reply — classic symptom of
-            // a desynchronized session after the server restarted (especially
-            // with FEC). Feed the session's blackhole detector.
-            if let Some(session) = session {
-                if a > 0 && b == 0 {
-                    session.note_stream_blackhole();
-                } else if b > 0 {
-                    session.note_stream_alive();
-                }
-            }
             #[cfg(feature = "qpp")]
             let qpp_suffix = if qpp_enabled { " (QPP)" } else { "" };
             #[cfg(not(feature = "qpp"))]
