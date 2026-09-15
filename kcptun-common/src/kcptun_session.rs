@@ -212,6 +212,14 @@ impl KcptunSession {
         self.smux.remove_stream(id);
     }
 
+    /// Streams still tracked by this session (in flight or lingering).
+    ///
+    /// A replaced session is kept alive until this reaches zero, so a transfer
+    /// that is still running when its slot is retired finishes normally.
+    pub fn active_stream_count(&self) -> usize {
+        self.smux.stream_count()
+    }
+
     /// Wake the shared SMUX writer.
     pub fn flush_notify(&self) -> Arc<knet::Notify> {
         self.flush_notify.clone()

@@ -277,15 +277,18 @@ fn test_autoexpire_and_multi_port() {
     );
 
     // ── Phase 2: --autoexpire ──
-    // creation + (5 + 2)s elapses, then the scavenger closes them. Poll for
-    // lines proving the parameter took effect and the close actually happened.
+    // creation + (5 + 2)s elapses, then the scavenger retires the idle
+    // sessions (they have no streams left, so the "finished serving" gate is
+    // satisfied). Poll for lines proving the parameter took effect and the
+    // close actually happened.
     let deadline = Instant::now() + Duration::from_secs(40);
     loop {
         let (started, closes) = {
             let log = stderr_buf.lock().unwrap();
             (
                 log.contains("scavenger started: autoexpire=5s, scavengettl=2s"),
-                log.matches("scavenger: session closed due to ttl").count(),
+                log.matches("scavenger: session retired (ttl reached")
+                    .count(),
             )
         };
         if started && closes >= 1 {

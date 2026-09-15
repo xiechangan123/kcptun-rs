@@ -304,8 +304,10 @@ pub(crate) async fn async_main() -> Result<()> {
     // Go scavenger deadline = creation + autoexpire + scavengeTTL.
     // Uses absolute creation time, NOT last activity — keepalive does NOT
     // delay expiry.  The accept loop proactively replaces sessions at
-    // `creation + autoexpire`; the scavenger force-closes any session still
-    // alive past `creation + autoexpire + scavengeTTL`.
+    // `creation + autoexpire`; the scavenger retires any session still alive
+    // past `creation + autoexpire + scavengeTTL` **and** done serving, so a
+    // replaced session finishes the streams it was already carrying instead of
+    // aborting them (see `client::should_retire_session`).
     if autoexpire > 0 {
         let s = stop_flag.clone();
         let scavenge_sessions = tracked_sessions.clone();
@@ -326,11 +328,27 @@ pub(crate) async fn async_main() -> Result<()> {
                         info!("scavenger: session normally closed");
                         return false;
                     }
-                    if client::is_session_scavenge_expired(conn, scavenge_autoexpire, scavenge_ttl)
-                    {
-                        info!("scavenger: session closed due to ttl");
+                    if client::should_retire_session(
+                        conn,
+                        scavenge_autoexpire,
+                        scavenge_ttl,
+                        knet::mono_ms(),
+                    ) {
+                        info!(
+                            "scavenger: session retired (ttl reached, {} stream(s) done)",
+                            conn.active_stream_count()
+                        );
                         conn.close();
                         return false;
+                    }
+                    if client::is_session_scavenge_expired(conn, scavenge_autoexpire, scavenge_ttl)
+                    {
+                        // Past the TTL but still serving: keep it until its
+                        // streams finish.
+                        log::debug!(
+                            "scavenger: session past ttl, waiting for {} stream(s)",
+                            conn.active_stream_count()
+                        );
                     }
                     true
                 });

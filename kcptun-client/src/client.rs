@@ -121,6 +121,48 @@ pub(crate) fn is_creation_scavenge_expired_at(
     now_ms > created_ms + (autoexpire_secs + scavengettl_secs) * 1000
 }
 
+/// Whether a replaced ("retired") session may be closed now.
+///
+/// Go hands a replaced session to the scavenger, which closes it once
+/// `creation + autoexpire + scavengeTTL` has passed — dropping whatever was
+/// still in flight on it. Here the deadline is the same, but the session must
+/// also have **finished serving**: while it still has streams, it keeps
+/// running so an in-progress transfer (a video download, say) completes even
+/// though its pool slot was already replaced. The session's own liveness
+/// watchdog still applies, so a retired session whose peer dies is torn down
+/// as usual instead of lingering.
+pub(crate) fn should_retire_session(
+    session: &kcptun_common::KcptunSession,
+    autoexpire_secs: u64,
+    scavengettl_secs: u64,
+    now_ms: u64,
+) -> bool {
+    should_close_retired(
+        session.created_ms(),
+        autoexpire_secs,
+        scavengettl_secs,
+        now_ms,
+        session.is_dead(),
+        session.active_stream_count(),
+    )
+}
+
+/// Pure form of [`should_retire_session`].
+fn should_close_retired(
+    created_ms: u64,
+    autoexpire_secs: u64,
+    scavengettl_secs: u64,
+    now_ms: u64,
+    dead: bool,
+    active_streams: usize,
+) -> bool {
+    if dead {
+        return true;
+    }
+    active_streams == 0
+        && is_creation_scavenge_expired_at(created_ms, autoexpire_secs, scavengettl_secs, now_ms)
+}
+
 /// Handle a single client connection: pipe between local TCP and SMUX stream
 /// with optional QPP. Compression is handled at the KCP/SMUX session level
 /// (matching Go kcptun architecture).
@@ -192,11 +234,12 @@ pub(crate) async fn handle_client(
 
 /// Reconnect a dead session at the given index, returning true on success.
 ///
-/// Fully tears down the previous session (stop read/write loops, close KCP
-/// and SMUX streams, drop the UDP socket) before the next accept uses the
-/// replacement — same net effect as restarting the client process. The old
-/// session is removed from the scavenger list so it cannot linger after its
-/// pool slot is replaced.
+/// The replaced session is *retired*, not killed: it moves out of the pool and
+/// onto the scavenger list, and keeps serving whatever it still has in flight
+/// — the scavenger closes it once its grace period has passed **and** it has
+/// no streams left (see [`should_retire_session`]). Tearing it down here would
+/// abort a download that happens to be running when an `autoexpire` slot is
+/// replaced, which surfaces to users as a stalled video or page.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn reconnect_session(
     conns: &SessionPool,
@@ -236,23 +279,31 @@ pub(crate) async fn reconnect_session(
     match build_session(remote, key, session_cfg, socket).await {
         Ok(new_conn) => {
             let new_conn = Arc::new(new_conn);
-            // Swap under the pool lock, then close the old session outside
-            // it. Closing under the lock can re-enter via Drop/task wakeups.
-            // Close asynchronously so a stuck old session cannot block the
-            // accept loop (observed during reconnect storms while the server
-            // is down: every TCP accept redialed and old.close() stalled).
+            // Swap under the pool lock; the retired session is handled outside
+            // it (closing under the lock can re-enter via Drop/task wakeups).
             let old = {
                 let mut guard = conns.lock();
                 std::mem::replace(&mut guard[idx], new_conn.clone())
             };
-            if let Some(tracked_sessions) = tracked_sessions {
-                let mut tracked = tracked_sessions.lock();
-                tracked.retain(|s| !Arc::ptr_eq(s, &old));
-                tracked.push(new_conn);
+            match tracked_sessions {
+                // Hand the retired session to the scavenger: it stays on the
+                // list and keeps serving its streams until the grace period
+                // has passed and they are done.
+                Some(tracked_sessions) => {
+                    let mut tracked = tracked_sessions.lock();
+                    tracked.retain(|s| !Arc::ptr_eq(s, &new_conn) && !Arc::ptr_eq(s, &old));
+                    tracked.push(old);
+                    tracked.push(new_conn);
+                }
+                // No scavenger (`--autoexpire 0`): a replacement only happens
+                // for a session that is already dead, so tear it down now
+                // instead of leaking its tasks.
+                None => {
+                    knet::spawn_task(async move {
+                        old.close();
+                    });
+                }
             }
-            knet::spawn_task(async move {
-                old.close();
-            });
             info!("connection {} reconnected", idx);
             true
         }
@@ -291,5 +342,51 @@ mod tests {
     fn test_scavenge_expired_after_grace() {
         // created at 1000ms, autoexpire=0, scavengettl=0, now=1001ms
         assert!(is_creation_scavenge_expired_at(1_000, 0, 0, 1_001));
+    }
+
+    /// A retired session is only closed once it is dead, or once its grace
+    /// period has passed *and* it has finished serving.
+    #[test]
+    fn test_retired_session_waits_for_streams() {
+        const CREATED: u64 = 0;
+        const AUTOEXPIRE: u64 = 300;
+        const TTL: u64 = 600;
+        let past_ttl = (AUTOEXPIRE + TTL + 1) * 1000;
+
+        // Still inside the grace period: keep it even when idle.
+        assert!(!should_close_retired(
+            CREATED,
+            AUTOEXPIRE,
+            TTL,
+            past_ttl - 1000,
+            false,
+            0
+        ));
+
+        // Past the grace period and idle: retire.
+        assert!(should_close_retired(
+            CREATED, AUTOEXPIRE, TTL, past_ttl, false, 0
+        ));
+
+        // Past the grace period but still serving: keep it so the transfer in
+        // flight completes (this is the fix — closing here aborts downloads
+        // whenever an autoexpire slot is replaced).
+        assert!(!should_close_retired(
+            CREATED, AUTOEXPIRE, TTL, past_ttl, false, 1
+        ));
+        assert!(!should_close_retired(
+            CREATED,
+            AUTOEXPIRE,
+            TTL,
+            past_ttl * 10,
+            false,
+            3
+        ));
+
+        // A dead session is torn down regardless of its streams.
+        assert!(should_close_retired(
+            CREATED, AUTOEXPIRE, TTL, past_ttl, true, 5
+        ));
+        assert!(should_close_retired(CREATED, AUTOEXPIRE, TTL, 0, true, 0));
     }
 }
