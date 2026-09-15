@@ -1486,6 +1486,16 @@ impl KCP {
     pub fn snd_una(&self) -> u32 {
         self.snd_una
     }
+
+    /// Peer's most recently advertised receive window (`rmt_wnd`).
+    ///
+    /// Zero means the peer is out of buffer space and is deliberately not
+    /// accepting new data, so a stalled `snd_una` is flow control rather than
+    /// a lost peer.
+    #[inline]
+    pub fn rmt_wnd(&self) -> u32 {
+        self.rmt_wnd
+    }
 }
 
 // ─── Errors ──────────────────────────────────────────────────────────────

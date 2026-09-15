@@ -773,6 +773,7 @@ dependencies = [
  "knet-rs",
  "kpprof-rs",
  "libc",
+ "log",
  "num_cpus",
  "parking_lot 0.12.5",
  "reed-solomon-erasure",

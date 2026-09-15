@@ -681,6 +681,15 @@ impl KcpStream {
         self.shared.kcp.lock().snd_una()
     }
 
+    /// Peer's most recently advertised receive window.
+    ///
+    /// Zero means the peer is out of buffer space and is *choosing* not to
+    /// accept more data, so stalled acknowledgement progress is flow control
+    /// rather than a desynchronized peer.
+    pub fn rmt_wnd(&self) -> u32 {
+        self.shared.kcp.lock().rmt_wnd()
+    }
+
     /// Whether KCP has declared the link dead (retransmission budget spent).
     ///
     /// The background flush loop keeps running after this; callers (the
@@ -822,7 +831,7 @@ impl KcpStream {
             return Ok(());
         }
         if !datagrams.is_empty() {
-            self.shared.mark_activity();
+            self.shared.mark_inbound();
         }
         let (data_ready, protocol_pending) = process_inbound_batch(&self.shared, &datagrams);
         if data_ready {
@@ -1300,6 +1309,7 @@ impl KcpStreamBuilder {
             adopt_conv: AtomicBool::new(self.adopt_conv),
             background_input: self.background_input,
             last_activity_ms: AtomicU64::new(knet::mono_ms()),
+            last_rx_ms: AtomicU64::new(knet::mono_ms()),
             is_sending: AtomicBool::new(false),
             fec_encoder,
             fec_decoder,
@@ -1631,9 +1641,9 @@ mod integ {
         assert_eq!(transport.async_calls.load(Ordering::Relaxed), 1);
     }
 
-    /// Fatal UDP errors (server restart / ICMP port unreachable) must close
-    /// the connection so the client accept-loop redials immediately instead
-    /// of waiting for dead_link or SMUX keepalive timeout.
+    /// A refused datagram before/while the peer is silent means the peer is
+    /// gone (cold port, server restart): close so the client accept-loop
+    /// redials instead of waiting for dead_link or the keepalive timeout.
     #[tokio::test]
     async fn note_io_error_closes_on_connection_refused() {
         let transport = Arc::new(PartialBatchTransport::with_try_limit(usize::MAX));
@@ -1646,6 +1656,25 @@ mod integ {
         ));
         assert!(conn.is_closed());
         assert!(conn.is_dead() || conn.is_closed());
+    }
+
+    /// The same error while the peer is actively streaming to us is spurious —
+    /// high-rate transfers surface isolated ICMP reports — and must not tear
+    /// the session down.
+    #[tokio::test]
+    async fn note_io_error_ignores_refused_while_peer_is_streaming() {
+        let transport = Arc::new(PartialBatchTransport::with_try_limit(usize::MAX));
+        let conn = conn_with_transport(transport).await;
+        conn.shared.first_inbound.store(true, Ordering::Release);
+        conn.shared
+            .last_rx_ms
+            .store(knet::mono_ms(), Ordering::Release);
+
+        conn.shared.note_io_error(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "stray icmp",
+        ));
+        assert!(!conn.is_closed());
     }
 
     #[tokio::test]

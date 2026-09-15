@@ -713,8 +713,20 @@ impl Session {
     }
 
     /// Returns true if no inbound activity within keepalive_timeout.
+    ///
+    /// Silence only counts as death while we are not the reason for it: once
+    /// our receive window is drained the peer's writer is blocked on us and
+    /// cannot send anything at all, so a quiet session is expected rather than
+    /// dead. Go's `smux` keeps the same guard
+    /// (`if atomic.LoadInt32(&s.bucket) > 0` — "recvLoop may block while bucket
+    /// is 0, in this case, session should not be closed"); without it a slow
+    /// local consumer tears down its own session exactly when a large download
+    /// is buffering.
     pub fn is_keepalive_timeout(&self) -> bool {
         if self.config.keepalive_timeout == 0 {
+            return false;
+        }
+        if !self.has_receive_capacity() {
             return false;
         }
         let last = self.last_activity_ms.load(Ordering::Relaxed);
@@ -1069,6 +1081,35 @@ mod tests {
         let session = Session::new_client(&DEFAULT_CONFIG).unwrap();
         // Initially, keepalive should not be needed yet
         assert!(!session.check_keepalive());
+    }
+
+    #[test]
+    fn keepalive_timeout_ignores_silence_while_receive_window_is_drained() {
+        // Go smux skips the timeout while its receive bucket is empty
+        // ("recvLoop may block while bucket is 0, in this case, session should
+        // not be closed"): the peer's writer is blocked on us, so a quiet
+        // session must not be torn down. Without this guard a slow local
+        // consumer kills its own session mid-download.
+        let mut cfg = DEFAULT_CONFIG.clone();
+        // `mono_ms()` counts from process start, so a stale timestamp cannot be
+        // faked by back-dating — shorten the timeout instead (`verify` requires
+        // timeout >= interval).
+        cfg.keepalive_interval = 1;
+        cfg.keepalive_timeout = 1;
+        let session = Session::new_client(&cfg).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+
+        session.token_bucket.store(0, Ordering::Relaxed);
+        assert!(
+            !session.is_keepalive_timeout(),
+            "silence must not be fatal while our receive window is drained"
+        );
+
+        session.token_bucket.store(1024, Ordering::Relaxed);
+        assert!(
+            session.is_keepalive_timeout(),
+            "silence with a free receive window is still a timeout"
+        );
     }
 
     #[test]

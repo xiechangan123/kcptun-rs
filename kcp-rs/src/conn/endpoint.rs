@@ -52,6 +52,10 @@ pub struct SharedIoState {
     pub(crate) background_input: bool,
     /// Last successful inbound or outbound user-data activity (monotonic ms).
     pub(crate) last_activity_ms: AtomicU64,
+    /// Last **inbound** datagram (never stamped by writes). Used to decide
+    /// whether an ICMP-style socket error is real peer loss or a stray error
+    /// arriving during an otherwise healthy flow.
+    pub(crate) last_rx_ms: AtomicU64,
     /// Send token: when `true`, either the flush loop or an inline writer is
     /// draining `raw_packets` + sending via `send_packets_with_fec().await`.
     /// Prevents wire-interleaving when both try to send concurrently.
@@ -90,7 +94,12 @@ pub struct SharedIoState {
     pub(crate) first_inbound: AtomicBool,
 }
 
-/// True when a datagram I/O error means this socket can never recover
+/// How long the peer must have been silent before an ICMP-style socket error
+/// is trusted. A peer that is still streaming to us is alive, so the error is
+/// a stray report rather than evidence the session is gone.
+const FATAL_ERROR_MIN_SILENCE_MS: u64 = 2_000;
+
+/// True when a datagram I/O error *can* mean this socket cannot recover
 /// without a full reconnect (server restart / ICMP port unreachable).
 fn is_fatal_udp_error(e: &io::Error) -> bool {
     matches!(
@@ -135,7 +144,24 @@ impl SharedIoState {
     /// connection so session death is visible via `is_closed()` instead of
     /// waiting for dead_link retransmit budget or SMUX keepalive timeout.
     pub(crate) fn note_io_error(&self, e: io::Error) {
-        let fatal = is_fatal_udp_error(&e);
+        // A ready peer means the error is spurious: high-rate flows do surface
+        // isolated ICMP port-unreachable reports (observed at ~4 GiB on
+        // loopback) while the peer keeps streaming to us, and tearing the
+        // session down there kills a perfectly healthy transfer. Only trust
+        // the error once the peer has actually gone quiet.
+        let socket_error = is_fatal_udp_error(&e);
+        // Before the first inbound datagram the session is still dialing, so a
+        // refusal is the only signal there is (dead port, server not up yet);
+        // afterwards it has to be corroborated by real silence.
+        let fatal = socket_error
+            && (!self.first_inbound.load(Ordering::Acquire)
+                || self.rx_age_ms() >= FATAL_ERROR_MIN_SILENCE_MS);
+        if socket_error {
+            log::warn!(
+                "transport error: {e} (fatal={fatal}, inbound_silent={}ms)",
+                self.rx_age_ms()
+            );
+        }
         *self.last_error.lock() = Some(e);
         if fatal {
             self.close();
@@ -152,6 +178,21 @@ impl SharedIoState {
     pub(crate) fn mark_activity(&self) {
         self.last_activity_ms
             .store(knet::mono_ms(), Ordering::Relaxed);
+    }
+
+    /// Stamp the inbound clock (and the shared liveness clock) for a datagram
+    /// received from the peer.
+    #[inline]
+    pub(crate) fn mark_inbound(&self) {
+        let now = knet::mono_ms();
+        self.last_rx_ms.store(now, Ordering::Relaxed);
+        self.last_activity_ms.store(now, Ordering::Relaxed);
+    }
+
+    /// Milliseconds since the last inbound datagram.
+    #[inline]
+    fn rx_age_ms(&self) -> u64 {
+        knet::mono_ms().saturating_sub(self.last_rx_ms.load(Ordering::Relaxed))
     }
 
     pub(crate) fn wake_reader(&self) {
@@ -553,7 +594,7 @@ pub(crate) fn spawn_input_loop(shared: Arc<SharedIoState>) -> knet::JoinHandle<(
                 }
                 knet::RaceOutcome::Second(_) => break, // close() cancelled the recv
             };
-            shared.mark_activity();
+            shared.mark_inbound();
 
             // Collect the full recv burst first, then process all datagrams
             // in one batch: FEC decode outside the KCP lock, one KCP lock for

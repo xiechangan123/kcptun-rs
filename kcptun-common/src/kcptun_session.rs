@@ -246,10 +246,14 @@ impl KcptunSession {
     }
 
     /// True when no inbound KCP datagram has been seen for the SMUX
-    /// keepalive timeout.
+    /// keepalive timeout, and our own receive window is not the reason for the
+    /// silence (see [`smux_rs::Session::is_keepalive_timeout`], which carries
+    /// the same guard as Go's smux).
     fn inbound_idle_expired(&self) -> bool {
-        self.inbound_idle_ms() >= self.smux.keepalive_timeout_secs().saturating_mul(1000)
-            && self.smux.keepalive_timeout_secs() > 0
+        let timeout = self.smux.keepalive_timeout_secs();
+        timeout > 0
+            && self.inbound_idle_ms() >= timeout.saturating_mul(1000)
+            && self.smux.has_receive_capacity()
     }
 
     /// Milliseconds since the last inbound KCP datagram.
@@ -346,7 +350,9 @@ const ACK_STALL_INBOUND_FRESH_MS: u64 = 5_000;
 ///
 /// The clock starts when data is in flight and nothing new gets acknowledged,
 /// and keeps running across inbound gaps (peer traffic is bursty). It only
-/// reports a stall once the peer has also been heard from recently.
+/// reports a stall once the peer has also been heard from recently and is
+/// advertising room for more data — a peer whose receive window is closed is
+/// applying backpressure, not losing our stream state.
 struct AckStallDetector {
     last_una: u32,
     stalled_since: Option<u64>,
@@ -367,8 +373,15 @@ impl AckStallDetector {
 
     /// Feed one sample (roughly every 500 ms); true means the session should
     /// be declared dead.
-    fn sample(&mut self, now_ms: u64, waiting: bool, una: u32, inbound_age_ms: u64) -> bool {
-        if !waiting || una != self.last_una {
+    fn sample(
+        &mut self,
+        now_ms: u64,
+        waiting: bool,
+        una: u32,
+        inbound_age_ms: u64,
+        peer_window_open: bool,
+    ) -> bool {
+        if !waiting || !peer_window_open || una != self.last_una {
             self.stalled_since = None;
         } else if self.stalled_since.is_none() {
             self.stalled_since = Some(now_ms);
@@ -393,10 +406,13 @@ mod ack_stall_tests {
         let mut det = AckStallDetector::new(7);
         let mut now = 0;
         while now < ACK_STALL_MS {
-            assert!(!det.sample(now, true, 7, FRESH), "fired early at {now}ms");
+            assert!(
+                !det.sample(now, true, 7, FRESH, true),
+                "fired early at {now}ms"
+            );
             now += 500;
         }
-        assert!(det.sample(ACK_STALL_MS, true, 7, FRESH));
+        assert!(det.sample(ACK_STALL_MS, true, 7, FRESH, true));
     }
 
     #[test]
@@ -406,33 +422,55 @@ mod ack_stall_tests {
         // inbound age grows with the outage, so the reachability check fails
         // even after the stall window has elapsed.
         let mut det = AckStallDetector::new(7);
-        assert!(!det.sample(0, true, 7, 100));
-        assert!(!det.sample(5_000, true, 7, 5_100));
-        assert!(!det.sample(ACK_STALL_MS, true, 7, 10_100));
-        assert!(!det.sample(20_000, true, 7, 20_100));
+        assert!(!det.sample(0, true, 7, 100, true));
+        assert!(!det.sample(5_000, true, 7, 5_100, true));
+        assert!(!det.sample(ACK_STALL_MS, true, 7, 10_100, true));
+        assert!(!det.sample(20_000, true, 7, 20_100, true));
+    }
+
+    #[test]
+    fn closed_peer_window_is_flow_control_not_desync() {
+        // A peer that advertises no room is deliberately not taking data: the
+        // frozen snd_una is backpressure (a slow consumer on the far side), so
+        // the session must survive even though the peer keeps talking to us.
+        let mut det = AckStallDetector::new(7);
+        let mut now = 0;
+        while now <= ACK_STALL_MS * 3 {
+            assert!(
+                !det.sample(now, true, 7, FRESH, false),
+                "fired on flow control at {now}ms"
+            );
+            now += 500;
+        }
     }
 
     #[test]
     fn acknowledgement_progress_restarts_the_clock() {
         let mut det = AckStallDetector::new(7);
         for now in (0..6_000).step_by(500) {
-            assert!(!det.sample(now, true, 7, FRESH), "fired early at {now}ms");
+            assert!(
+                !det.sample(now, true, 7, FRESH, true),
+                "fired early at {now}ms"
+            );
         }
         // Peer acknowledged more data: the window starts over from here.
-        assert!(!det.sample(6_000, true, 8, FRESH));
+        assert!(!det.sample(6_000, true, 8, FRESH, true));
         let mut now = 6_500;
         while now < 16_500 {
-            assert!(!det.sample(now, true, 8, FRESH), "fired early at {now}ms");
+            assert!(
+                !det.sample(now, true, 8, FRESH, true),
+                "fired early at {now}ms"
+            );
             now += 500;
         }
-        assert!(det.sample(16_500, true, 8, FRESH));
+        assert!(det.sample(16_500, true, 8, FRESH, true));
     }
 
     #[test]
     fn nothing_in_flight_never_fires() {
         let mut det = AckStallDetector::new(7);
-        assert!(!det.sample(0, false, 7, FRESH));
-        assert!(!det.sample(600_000, false, 7, FRESH));
+        assert!(!det.sample(0, false, 7, FRESH, true));
+        assert!(!det.sample(600_000, false, 7, FRESH, true));
     }
 
     #[test]
@@ -464,11 +502,18 @@ async fn watchdog_loop(
         let now = knet::mono_ms();
         let timeout = smux.keepalive_timeout_secs();
         let inbound_age = now.saturating_sub(last_inbound_ms.load(Ordering::Acquire));
-        let timed_out = timeout > 0 && inbound_age >= timeout.saturating_mul(1000);
+        // Same guard as `smux.is_keepalive_timeout()`: while our receive window
+        // is drained the peer's writer is blocked on us, so silence is expected.
+        let timed_out = timeout > 0
+            && inbound_age >= timeout.saturating_mul(1000)
+            && smux.has_receive_capacity();
 
         let una = kcp.snd_una();
         let waiting = kcp.wait_send() > 0;
-        let ack_stalled = ack_stall.sample(now, waiting, una, inbound_age);
+        // A closed peer window means it is out of buffer space and is choosing
+        // not to take more data, so an unacknowledged backlog is flow control.
+        let peer_window_open = kcp.rmt_wnd() > 0;
+        let ack_stalled = ack_stall.sample(now, waiting, una, inbound_age, peer_window_open);
         if log::log_enabled!(log::Level::Debug) {
             // Only while acknowledgements are actually behind — a bulk transfer
             // keeps data in flight constantly and must not log every tick.
