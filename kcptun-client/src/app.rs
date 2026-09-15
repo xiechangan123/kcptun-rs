@@ -355,6 +355,11 @@ pub(crate) async fn async_main() -> Result<()> {
     let round_robin = Arc::new(AtomicUsize::new(0));
     let conn_count_usize = conns.lock().len();
     anyhow::ensure!(conn_count_usize > 0, "connection pool is empty");
+    // Per-slot reconnect cooldown: while the server is down every TCP accept
+    // would otherwise redial and thrash sockets/tasks. Match Go's lazy redial
+    // by allowing at most one dial per slot per second.
+    let mut last_redial_ms = vec![0u64; conn_count_usize];
+    let mut idle_ticks = 0u32;
 
     loop {
         if stop_flag.load(Ordering::Relaxed) {
@@ -369,8 +374,16 @@ pub(crate) async fn async_main() -> Result<()> {
                 error!("accept error: {}", e);
                 continue;
             }
-            Err(_) => continue, // timeout, loop back to check stop_flag
+            Err(_) => {
+                idle_ticks += 1;
+                if idle_ticks >= 20 {
+                    idle_ticks = 0;
+                    debug!("accept loop idle; pool={}", conns.lock().len());
+                }
+                continue; // timeout, loop back to check stop_flag
+            }
         };
+        idle_ticks = 0;
 
         // Process the accepted connection, then drain any already-queued
         // connections in the same wakeup. Without this, a burst of concurrent
@@ -388,15 +401,31 @@ pub(crate) async fn async_main() -> Result<()> {
             // Ensure a live KCP/SMUX session (Go muxSession.Open auto-redial).
             // Go also proactively reconnects when `now > creation + autoexpire`
             // (absolute deadline, independent of keepalive activity).
+            //
+            // After a server restart every pool slot is dead; retry a couple
+            // of times so a failed dial (server still binding) does not
+            // silently accept the TCP conn into a black hole.
             let mut opened: Option<Arc<smux_rs::stream::Stream>> = None;
-            for _attempt in 0..2 {
+            for _attempt in 0..3 {
+                let now_ms = knet::mono_ms();
                 let needs_reconnect = {
                     let guard = conns.lock();
-                    guard[idx].is_dead()
-                        || (autoexpire > 0
-                            && client::is_session_expired(&guard[idx], autoexpire.max(0) as u64))
+                    let dead = guard[idx].is_dead();
+                    let expired = autoexpire > 0
+                        && client::is_session_expired(&guard[idx], autoexpire.max(0) as u64);
+                    // Cooldown: skip redial if we dialed this slot <1s ago
+                    // (server still down, or the replacement died instantly).
+                    let cooled_down = now_ms.saturating_sub(last_redial_ms[idx]) >= 1000;
+                    if !dead && !expired && log::log_enabled!(log::Level::Debug) {
+                        log::debug!(
+                            "conn {idx} alive: last_inbound_age_ms={}",
+                            guard[idx].inbound_idle_ms()
+                        );
+                    }
+                    (dead || expired) && cooled_down
                 };
                 if needs_reconnect {
+                    last_redial_ms[idx] = now_ms;
                     let ok = client::reconnect_session(
                         &conns,
                         (autoexpire > 0).then_some(&tracked_sessions),
@@ -417,12 +446,19 @@ pub(crate) async fn async_main() -> Result<()> {
                 let stream_result = {
                     let guard = conns.lock();
                     let c = &guard[idx];
-                    match c.open_stream() {
-                        Ok(stream) => Some(stream),
-                        Err(e) => {
-                            error!("failed to open SMUX stream: {:?}", e);
-                            c.close();
-                            None
+                    // The replacement session may already be dead (e.g. the
+                    // server is still down and the first UDP send got
+                    // ECONNREFUSED). Do not open a stream on it — retry dial.
+                    if c.is_dead() {
+                        None
+                    } else {
+                        match c.open_stream() {
+                            Ok(stream) => Some(stream),
+                            Err(e) => {
+                                error!("failed to open SMUX stream: {:?}", e);
+                                c.close();
+                                None
+                            }
                         }
                     }
                 };
@@ -446,9 +482,9 @@ pub(crate) async fn async_main() -> Result<()> {
                 info!("accepted connection from {} (stream {})", peer, stream_id);
             }
 
-            let flush_notify_ref = {
+            let (flush_notify_ref, session_ref) = {
                 let guard = conns.lock();
-                guard[idx].flush_notify()
+                (guard[idx].flush_notify(), Some(guard[idx].clone()))
             };
 
             let qpp_key = key.to_vec();
@@ -456,6 +492,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 if let Err(e) = client::handle_client(
                     local,
                     smux_stream,
+                    session_ref,
                     qpp_enabled,
                     qpp_key,
                     qpp_count,

@@ -1621,6 +1621,32 @@ mod integ {
         assert_eq!(transport.async_calls.load(Ordering::Relaxed), 1);
     }
 
+    /// Fatal UDP errors (server restart / ICMP port unreachable) must close
+    /// the connection so the client accept-loop redials immediately instead
+    /// of waiting for dead_link or SMUX keepalive timeout.
+    #[tokio::test]
+    async fn note_io_error_closes_on_connection_refused() {
+        let transport = Arc::new(PartialBatchTransport::with_try_limit(usize::MAX));
+        let conn = conn_with_transport(transport).await;
+        assert!(!conn.is_closed());
+
+        conn.shared
+            .note_io_error(io::Error::new(io::ErrorKind::ConnectionRefused, "peer down"));
+        assert!(conn.is_closed());
+        assert!(conn.is_dead() || conn.is_closed());
+    }
+
+    #[tokio::test]
+    async fn note_io_error_keeps_connection_on_transient_error() {
+        let transport = Arc::new(PartialBatchTransport::with_try_limit(usize::MAX));
+        let conn = conn_with_transport(transport).await;
+        assert!(!conn.is_closed());
+
+        conn.shared
+            .note_io_error(io::Error::new(io::ErrorKind::WouldBlock, "transient"));
+        assert!(!conn.is_closed());
+    }
+
     #[tokio::test]
     async fn inline_partial_send_preserves_fec_wire_batch() {
         let transport = Arc::new(PartialBatchTransport::with_try_limit(1));

@@ -851,13 +851,17 @@ mod tests {
     /// M0.1 — the M1-A SMUX→KcpStream write path must sense backpressure:
     /// when the peer never ACKs, `wait_send` stays ≤ `snd_wnd` and repeated
     /// writes stall (Pending) instead of buffering unboundedly in `snd_queue`.
+    ///
+    /// The peer is a live UDP socket that never reads: sends succeed at the
+    /// kernel (no ICMP port-unreachable / ConnectionRefused), so the
+    /// connection stays open and only KCP backpressure applies. A closed port
+    /// would now be treated as a fatal peer-down error and close the stream.
     #[cfg(feature = "tokio")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn kcp_stream_write_backpressure_bounds_inflight() {
-        // Bind-then-drop a port so nothing listens on it: the peer never ACKs.
-        let tmp = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        let dead = tmp.local_addr().unwrap();
-        drop(tmp);
+        // Live black-hole peer: bound and kept alive, but never read — no ACKs.
+        let blackhole = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let dead = blackhole.local_addr().unwrap();
 
         let sock = Arc::new(knet::DatagramSocket::Udp(
             knet::UdpSocket::connect(SocketAddr::from(([127, 0, 0, 1], 0)), dead).unwrap(),
@@ -920,6 +924,8 @@ mod tests {
         );
 
         conn.close();
+        // Keep the black-hole peer alive until the connection is fully closed.
+        drop(blackhole);
     }
 
     #[cfg(feature = "tokio")]

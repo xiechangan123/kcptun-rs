@@ -90,6 +90,17 @@ pub struct SharedIoState {
     pub(crate) first_inbound: AtomicBool,
 }
 
+/// True when a datagram I/O error means this socket can never recover
+/// without a full reconnect (server restart / ICMP port unreachable).
+fn is_fatal_udp_error(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::BrokenPipe
+    )
+}
+
 impl SharedIoState {
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
@@ -116,6 +127,18 @@ impl SharedIoState {
             if let Some(w) = self.read_waker.lock().take() {
                 w.wake();
             }
+        }
+    }
+
+    /// Record a background-loop I/O error. Fatal UDP errors (peer down /
+    /// ICMP port unreachable after a server restart) also close the
+    /// connection so session death is visible via `is_closed()` instead of
+    /// waiting for dead_link retransmit budget or SMUX keepalive timeout.
+    pub(crate) fn note_io_error(&self, e: io::Error) {
+        let fatal = is_fatal_udp_error(&e);
+        *self.last_error.lock() = Some(e);
+        if fatal {
+            self.close();
         }
     }
 
@@ -261,7 +284,7 @@ impl SharedIoState {
                 true
             }
             Err(e) => {
-                *self.last_error.lock() = Some(e);
+                self.note_io_error(e);
                 self.recycle_raw_packets(packets);
                 self.finish_sending();
                 true // consumed the burst (error logged); no need to re-notify
@@ -311,7 +334,7 @@ impl SharedIoState {
             match result {
                 Ok(r) => {
                     if let Err(e) = r {
-                        *shared.last_error.lock() = Some(e);
+                        shared.note_io_error(e);
                     }
                     // fec_wire is a fresh Vec from fec_expand_packets (not
                     // pool-backed); dropping it is the recycle.
@@ -433,7 +456,7 @@ impl SharedIoState {
         // async send_batch on WouldBlock. Avoids a reactor scheduling hop
         // per burst when the kernel send buffer has room.
         if let Err(e) = self.flush_tx_batch(&packets).await {
-            *self.last_error.lock() = Some(e);
+            self.note_io_error(e);
         }
         self.recycle_raw_packets(packets);
         self.finish_sending();
@@ -518,7 +541,13 @@ pub(crate) fn spawn_input_loop(shared: Arc<SharedIoState>) -> knet::JoinHandle<(
                 knet::RaceOutcome::First(Ok(_)) => continue,
                 knet::RaceOutcome::First(Err(_)) if shared.is_closed() => break,
                 knet::RaceOutcome::First(Err(e)) => {
-                    *shared.last_error.lock() = Some(e);
+                    // ICMP port-unreachable (server restart) is fatal for a
+                    // connected UDP socket: close so the client accept-loop
+                    // redials instead of spinning until keepalive timeout.
+                    shared.note_io_error(e);
+                    if shared.is_closed() {
+                        break;
+                    }
                     knet::sleep_ms(10).await;
                     continue;
                 }
@@ -880,7 +909,7 @@ pub(crate) fn spawn_flush_loop(shared: Arc<SharedIoState>) -> knet::JoinHandle<(
                         // Try non-blocking sendmmsg first (sync fast path);
                         // falls back to async send_batch on WouldBlock.
                         if let Err(e) = shared.flush_tx_batch(&fast_packets).await {
-                            *shared.last_error.lock() = Some(e);
+                            shared.note_io_error(e);
                         }
                         crate::snmp::add(&crate::snmp::DEFAULT_SNMP.write_flush_sends, 1);
                     }
@@ -942,7 +971,7 @@ pub(crate) fn spawn_flush_loop(shared: Arc<SharedIoState>) -> knet::JoinHandle<(
                     // Try non-blocking sendmmsg first (sync fast path);
                     // falls back to async send_batch on WouldBlock.
                     if let Err(e) = shared.flush_tx_batch(&packets).await {
-                        *shared.last_error.lock() = Some(e);
+                        shared.note_io_error(e);
                     }
                     crate::snmp::add(&crate::snmp::DEFAULT_SNMP.write_flush_sends, 1);
                 }

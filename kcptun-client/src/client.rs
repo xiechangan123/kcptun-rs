@@ -129,6 +129,7 @@ pub(crate) fn is_creation_scavenge_expired_at(
 pub(crate) async fn handle_client(
     local: knet::TcpStream,
     smux_stream: Arc<smux_rs::stream::Stream>,
+    session: Option<SessionRef>,
     qpp_enabled: bool,
     qpp_key: Vec<u8>,
     qpp_count: u16,
@@ -174,6 +175,16 @@ pub(crate) async fn handle_client(
 
     match pipe_result {
         Ok((a, b)) => {
+            // Sent into the tunnel but never got a reply — classic symptom of
+            // a desynchronized session after the server restarted (especially
+            // with FEC). Feed the session's blackhole detector.
+            if let Some(session) = session {
+                if a > 0 && b == 0 {
+                    session.note_stream_blackhole();
+                } else if b > 0 {
+                    session.note_stream_alive();
+                }
+            }
             #[cfg(feature = "qpp")]
             let qpp_suffix = if qpp_enabled { " (QPP)" } else { "" };
             #[cfg(not(feature = "qpp"))]
@@ -191,6 +202,12 @@ pub(crate) async fn handle_client(
 }
 
 /// Reconnect a dead session at the given index, returning true on success.
+///
+/// Fully tears down the previous session (stop read/write loops, close KCP
+/// and SMUX streams, drop the UDP socket) before the next accept uses the
+/// replacement — same net effect as restarting the client process. The old
+/// session is removed from the scavenger list so it cannot linger after its
+/// pool slot is replaced.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn reconnect_session(
     conns: &SessionPool,
@@ -230,10 +247,23 @@ pub(crate) async fn reconnect_session(
     match build_session(remote, key, session_cfg, socket).await {
         Ok(new_conn) => {
             let new_conn = Arc::new(new_conn);
-            conns.lock()[idx] = new_conn.clone();
+            // Swap under the pool lock, then close the old session outside
+            // it. Closing under the lock can re-enter via Drop/task wakeups.
+            // Close asynchronously so a stuck old session cannot block the
+            // accept loop (observed during reconnect storms while the server
+            // is down: every TCP accept redialed and old.close() stalled).
+            let old = {
+                let mut guard = conns.lock();
+                std::mem::replace(&mut guard[idx], new_conn.clone())
+            };
             if let Some(tracked_sessions) = tracked_sessions {
-                tracked_sessions.lock().push(new_conn);
+                let mut tracked = tracked_sessions.lock();
+                tracked.retain(|s| !Arc::ptr_eq(s, &old));
+                tracked.push(new_conn);
             }
+            knet::spawn_task(async move {
+                old.close();
+            });
             info!("connection {} reconnected", idx);
             true
         }

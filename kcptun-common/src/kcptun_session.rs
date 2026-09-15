@@ -32,6 +32,15 @@ pub struct KcptunSession {
     flush_notify: Arc<knet::Notify>,
     dead: Arc<AtomicBool>,
     created_ms: u64,
+    /// Last successful KCP read (inbound datagram). Distinct from
+    /// `kcp.last_activity_ms`, which is also stamped on writes — after a
+    /// server restart the writer keeps stamping while the peer is gone.
+    last_inbound_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Consecutive local streams that transferred outbound bytes but never
+    /// received a response. After a server restart with FEC, the session can
+    /// keep exchanging (or appearing to exchange) packets while every new
+    /// stream is a black hole — dead_link/keepalive never fire.
+    stream_fails: Arc<std::sync::atomic::AtomicU32>,
     _handles: Vec<knet::JoinHandle<()>>,
 }
 
@@ -133,6 +142,8 @@ impl KcptunSession {
         let dead = Arc::new(AtomicBool::new(false));
         let compressor = Arc::new(Mutex::new(snap::write::FrameEncoder::new(Vec::new())));
         let limiter = Arc::new(RateLimiter::new(rate_limit));
+        let last_inbound_ms = Arc::new(std::sync::atomic::AtomicU64::new(knet::mono_ms()));
+        let stream_fails = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let handles = vec![
             knet::spawn_task(read_loop(
                 kcp.clone(),
@@ -140,6 +151,7 @@ impl KcptunSession {
                 flush_notify.clone(),
                 dead.clone(),
                 nocomp,
+                last_inbound_ms.clone(),
             )),
             knet::spawn_task(write_loop(
                 kcp.clone(),
@@ -150,6 +162,17 @@ impl KcptunSession {
                 limiter,
                 nocomp,
             )),
+            // Independent watchdog: write_loop can block inside kcp.write_all
+            // when the peer is gone and the send window fills with unacked
+            // data, so it never reaches its keepalive/death checks. This task
+            // keeps ticking and force-closes the session (server-restart
+            // recovery must not wait for dead_link or a stuck writer).
+            knet::spawn_task(watchdog_loop(
+                kcp.clone(),
+                smux.clone(),
+                dead.clone(),
+                last_inbound_ms.clone(),
+            )),
         ];
         let session = Self {
             kcp,
@@ -157,6 +180,8 @@ impl KcptunSession {
             flush_notify,
             dead,
             created_ms: knet::mono_ms(),
+            last_inbound_ms,
+            stream_fails,
             _handles: handles,
         };
         kcp_rs::DEFAULT_SNMP.session_opened(active_open);
@@ -213,12 +238,53 @@ impl KcptunSession {
     }
 
     /// Whether the KCP or SMUX session has failed or timed out.
+    ///
+    /// Inbound silence longer than the keepalive timeout also counts as
+    /// death: after a server restart the old socket may keep accepting
+    /// writes (macOS often swallows ICMP) while no peer data ever returns.
+    /// A restarted client would not keep such a session.
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Acquire)
             || self.kcp.is_dead()
             || self.kcp.is_closed()
             || self.smux.is_closed()
             || self.smux.is_keepalive_timeout()
+            || self.inbound_idle_expired()
+    }
+
+    /// True when no inbound KCP datagram has been seen for the SMUX
+    /// keepalive timeout.
+    fn inbound_idle_expired(&self) -> bool {
+        self.inbound_idle_ms() >= self.smux.keepalive_timeout_secs().saturating_mul(1000)
+            && self.smux.keepalive_timeout_secs() > 0
+    }
+
+    /// Milliseconds since the last inbound KCP datagram.
+    pub fn inbound_idle_ms(&self) -> u64 {
+        knet::mono_ms().saturating_sub(self.last_inbound_ms.load(Ordering::Acquire))
+    }
+
+    /// Record a stream that sent data but never received a reply.
+    ///
+    /// After a server restart the old session can look alive (KCP/FEC
+    /// packets still flow) while every new SMUX stream is a black hole.
+    /// Three consecutive silent streams force a close so the accept-loop
+    /// redials, matching a client process restart.
+    pub fn note_stream_blackhole(&self) {
+        const FAIL_LIMIT: u32 = 3;
+        let fails = self.stream_fails.fetch_add(1, Ordering::Relaxed) + 1;
+        if fails >= FAIL_LIMIT {
+            log::warn!(
+                "session marked dead: {} consecutive streams sent data with no reply",
+                fails
+            );
+            self.close();
+        }
+    }
+
+    /// Record a stream that received a reply — clears the blackhole streak.
+    pub fn note_stream_alive(&self) {
+        self.stream_fails.store(0, Ordering::Relaxed);
     }
 
     /// Close KCP, SMUX, and all streams.
@@ -243,6 +309,7 @@ async fn read_loop(
     flush: Arc<knet::Notify>,
     dead: Arc<AtomicBool>,
     nocomp: bool,
+    last_inbound_ms: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let mut buf = vec![0u8; 64 * 1024];
     let mut decoder = (!nocomp).then(crate::SnappyStreamDecoder::new);
@@ -263,6 +330,7 @@ async fn read_loop(
             Err(_) if kcp.is_closed() => break,
             Err(_) => continue,
         };
+        last_inbound_ms.store(knet::mono_ms(), Ordering::Release);
         let result = if let Some(decoder) = decoder.as_mut() {
             decoder.feed(&buf[..n]).and_then(|data| {
                 if data.is_empty() {
@@ -286,6 +354,42 @@ async fn read_loop(
     dead.store(true, Ordering::Release);
     smux.close();
     kcp.close();
+}
+
+/// Force-close the session when the peer has gone silent, independently of
+/// the write path (which can block on a full send window after a server
+/// restart). Also closes when streams have unanswered writes — the FEC
+/// desync case keeps KCP packets flowing while every stream is a blackhole.
+async fn watchdog_loop(
+    kcp: Arc<kcp_rs::KcpStream>,
+    smux: Arc<smux_rs::Session>,
+    dead: Arc<AtomicBool>,
+    last_inbound_ms: Arc<std::sync::atomic::AtomicU64>,
+) {
+    while !dead.load(Ordering::Acquire) && !smux.is_closed() && !kcp.is_closed() {
+        knet::sleep_ms(500).await;
+        let timeout = smux.keepalive_timeout_secs();
+        let timed_out = timeout > 0
+            && knet::mono_ms().saturating_sub(last_inbound_ms.load(Ordering::Acquire))
+                >= timeout.saturating_mul(1000);
+        // 2+ streams stuck ≥3s, or 1 stream stuck ≥15s = desynchronized session
+        // (typically after the server restarted with FEC still enabled).
+        // A single slow stream must not tear down a healthy session.
+        let blackhole = smux.has_blackhole_writes(3_000, 15_000);
+        if kcp.is_dead() || smux.is_keepalive_timeout() || timed_out || blackhole {
+            log::warn!(
+                "session watchdog: closing (kcp_dead={}, smux_timeout={}, inbound_idle={}, blackhole={})",
+                kcp.is_dead(),
+                smux.is_keepalive_timeout(),
+                timed_out,
+                blackhole
+            );
+            dead.store(true, Ordering::Release);
+            smux.close();
+            kcp.close();
+            break;
+        }
+    }
 }
 
 async fn write_loop(

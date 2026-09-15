@@ -211,8 +211,10 @@ impl ReconnectEnv {
     }
 
     fn restart_server(&mut self) {
+        // Kill only the server Child. Do NOT kill_port(srv_port): the client's
+        // connected UDP sockets also match `lsof -ti:PORT`, so kill -9 would
+        // take down the client (the old test restarted the client to hide this).
         self.kill_server();
-        kill_port(self.srv_port);
         thread::sleep(Duration::from_millis(500));
 
         let mut srv_args: Vec<String> = vec![
@@ -253,6 +255,13 @@ impl ReconnectEnv {
             self.procs.push(sv);
         }
         thread::sleep(Duration::from_secs(1));
+        if let Some(cli) = self.procs.get_mut(2) {
+            match cli.try_wait() {
+                Ok(Some(status)) => println!("  WARNING: client exited early: {status}"),
+                Ok(None) => println!("  client still running"),
+                Err(e) => println!("  client wait err: {e}"),
+            }
+        }
     }
 
     fn kill_client(&mut self) {
@@ -374,25 +383,20 @@ fn test_reconnect_after_restart() {
     }
     println!("  probes done (~8s of retransmit traffic)");
 
-    // Restart
+    // Restart server only — the client must redial in-process (clear old KCP
+    // state + new UDP socket), matching the production server-restart path.
+    // Do NOT restart the client: that would hide a broken reconnect path.
     e.restart_server();
-    println!("  server restarted");
+    println!("  server restarted (client kept running)");
 
-    // To ensure a clean reconnect, restart the client process as well.
-    // This forces brand new KCP connections to the live server.
-    // (The lazy redial on existing client process may take longer or be racy
-    // in this test harness; restarting the client reliably exercises the
-    // post-restart dial path.)
-    e.restart_client();
-    println!("  client restarted");
-
-    // Give new conns a moment to come up.
-    thread::sleep(Duration::from_millis(1500));
-    println!("  grace after client restart");
+    // Give the client a moment to observe fatal UDP errors / keepalive and
+    // replace dead pool slots, then probe until echo recovers.
+    // Default SMUX keepalive timeout is 30s — allow that plus reconnect.
+    thread::sleep(Duration::from_millis(500));
 
     let mut consecutive = 0usize;
     let start = Instant::now();
-    for i in 0..60 {
+    for i in 0..150 {
         let p = make_payload(300 + i, 256);
         match e.send_echo(&p) {
             Some(resp) if resp == p => {
@@ -406,19 +410,20 @@ fn test_reconnect_after_restart() {
             }
             _ => {
                 consecutive = 0;
-                thread::sleep(Duration::from_millis(300));
+                thread::sleep(Duration::from_millis(200));
             }
         }
     }
     println!(
-        "  recovery overall: {}/60 after {:?}",
+        "  recovery overall: {}/150 after {:?}",
         consecutive,
         start.elapsed()
     );
     drop(e);
     assert!(
         consecutive >= 8,
-        "reconnect recovery failed: only {consecutive} consecutive OK (need 8)"
+        "reconnect recovery failed: only {consecutive} consecutive OK (need 8). \
+         Client should redial in-process after server restart without a client restart."
     );
     println!("✅ multi-conn reconnect OK (--conn 4, {consecutive} consecutive)");
 }
