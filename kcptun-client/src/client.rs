@@ -31,6 +31,8 @@ pub(crate) struct ClientDialOptions {
     pub(crate) streambuf: usize,
     pub(crate) framesize: usize,
     pub(crate) keepalive: u64,
+    pub(crate) keepalivetimeout: u64,
+    pub(crate) ackstalltimeout: u64,
     pub(crate) nocomp: bool,
     pub(crate) ratelimit: u32,
 }
@@ -63,8 +65,11 @@ pub(crate) async fn build_session(
         max_stream_buffer: cfg.streambuf,
         max_frame_size: cfg.framesize,
         keepalive_interval: cfg.keepalive,
-        // Go's BuildSmuxConfig changes only the interval; timeout remains 30s.
-        keepalive_timeout: 30,
+        // Go's BuildSmuxConfig leaves the timeout at 30s; it is configurable
+        // here because on a lossy path the 30s inbound-silence rule turns a
+        // transient dropout into a session teardown that kills every stream on
+        // it (measured: 20MB downloads cut to 0-3MB, one session death each).
+        keepalive_timeout: cfg.keepalivetimeout,
     };
     let config = kcptun_common::KcptunConfig {
         kcp: params.to_kcp_config(),
@@ -72,6 +77,7 @@ pub(crate) async fn build_session(
         nocomp: cfg.nocomp,
         rate_limit: cfg.ratelimit,
         offload_profile: kcrypt_rs::OffloadProfile::Tokio,
+        ack_stall_secs: cfg.ackstalltimeout,
     };
     kcptun_common::KcptunSession::connect(socket, remote, key, &cfg.crypt, &config).await
 }

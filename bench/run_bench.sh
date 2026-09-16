@@ -46,6 +46,25 @@ BENCH_ROUNDS="${BENCH_ROUNDS:-3}"
 # Set 0 to preserve each backend's own default instead.
 BENCH_WORKERS="${BENCH_WORKERS:-4}"
 
+# Backend logs. A failed transfer ("only received 0/2097152 bytes") says nothing
+# about *which* side stopped, so every attempt's server/client stdout+stderr is
+# kept and dumped when an attempt fails. Set BENCH_KEEP_LOGS=0 to discard them.
+BENCH_LOG_DIR="${BENCH_LOG_DIR:-/tmp/kcptun-bench-logs}"
+BENCH_KEEP_LOGS="${BENCH_KEEP_LOGS:-1}"
+LOG_TAG="pair"
+srv_log() { if [ "$BENCH_KEEP_LOGS" = "1" ]; then echo "$BENCH_LOG_DIR/$LOG_TAG-server.log"; else echo /dev/null; fi; }
+cli_log() { if [ "$BENCH_KEEP_LOGS" = "1" ]; then echo "$BENCH_LOG_DIR/$LOG_TAG-client.log"; else echo /dev/null; fi; }
+dump_logs() {
+    echo "  ❌ $1"
+    [ "$BENCH_KEEP_LOGS" = "1" ] || return 0
+    for f in "$(srv_log)" "$(cli_log)"; do
+        [ -s "$f" ] || continue
+        echo "  ── last 25 lines of $f ──"
+        tail -n 25 "$f" | sed 's/^/  | /'
+    done
+    echo "  ── full logs: $BENCH_LOG_DIR ──"
+}
+
 GO_SERVER="${GO_SERVER:-./tests/kcptun-go/server}"
 GO_CLIENT="${GO_CLIENT:-./tests/kcptun-go/client}"
 RUST_TOKIO_SERVER="${RUST_TOKIO_SERVER:-./target/release/kcptun-server}"
@@ -202,7 +221,7 @@ while True:
 start_server() {
     local bin=$1
     launch_backend "$bin" -l "0.0.0.0:$SERVER_PORT" -t "127.0.0.1:$ECHO_PORT" \
-        --key "$KEY" $SERVER_ARGS 2>/dev/null &
+        --key "$KEY" $SERVER_ARGS > "$(srv_log)" 2>&1 &
     SERVER_PID=$!
     # kcptun server listens on UDP (not TCP), so wait_for_port can't probe it.
     # Poll for process liveness + give it time to bind the UDP socket.
@@ -217,7 +236,7 @@ start_server() {
 start_client() {
     local bin=$1
     launch_backend "$bin" -l "127.0.0.1:$CLIENT_PORT" -r "127.0.0.1:$SERVER_PORT" \
-        --key "$KEY" $CLIENT_ARGS 2>/dev/null &
+        --key "$KEY" $CLIENT_ARGS > "$(cli_log)" 2>&1 &
     CLIENT_PID=$!
     # Readiness means an actual TCP → KCP → SMUX → TCP echo, not merely that
     # the client bound its local listener (up to ~10s for a cold handshake).
@@ -287,29 +306,67 @@ run_one() {
         return 1
     fi
 
-    cleanup
-    next_ports
+    # One measurement attempt with a fresh backend pair. A single hiccup (a
+    # cold handshake racing the first transfer, or the machine briefly
+    # oversubscribed) used to abort the whole pair and print nothing but
+    # "only received 0/N bytes"; now the attempt is retried once and the
+    # backend logs are dumped when it still fails.
+    local attempt=1 ok=""
+    while [ "$attempt" -le 2 ]; do
+        LOG_TAG=$(printf '%s' "$label" | tr -c 'A-Za-z0-9' '-')
+        LOG_TAG="${LOG_TAG}a${attempt}"
+        cleanup
+        next_ports
+        TP_VAL=""
+        LAT_VAL=""
+        if attempt_once "$result_file" "$client_bin" "$server_bin"; then
+            ok=1
+            break
+        fi
+        if [ "$attempt" = "1" ]; then
+            echo "  ⚠️  attempt 1 failed — retrying once with fresh backends"
+            dump_logs "attempt 1 failed"
+            echo ""
+        fi
+        attempt=$((attempt + 1))
+    done
 
-    start_echo       || { echo ""; cleanup; return 1; }
-    start_server "$server_bin" || { echo ""; cleanup; return 1; }
-    start_client "$client_bin" || { echo ""; cleanup; return 1; }
+    rm -f "$result_file"
+    echo ""
+    cleanup 2>/dev/null
+    if [ -z "$ok" ]; then
+        dump_logs "measurement failed twice"
+        return 1
+    fi
+    return 0
+}
+
+# attempt_once RESULT_FILE CLIENT_BIN SERVER_BIN
+# Starts a fresh echo/server/client triple, runs the load generator, and sets
+# TP_VAL/LAT_VAL on success. Live output is always printed.
+attempt_once() {
+    local result_file=$1 client_bin=$2 server_bin=$3
+
+    start_echo       || { echo ""; return 1; }
+    start_server "$server_bin" || { echo ""; return 1; }
+    start_client "$client_bin" || { echo ""; return 1; }
 
     # Progress goes to stderr (live); results are captured for parsing.
     python3 bench/throughput.py "$CLIENT_PORT" \
         --data-mb "$DATA_MB" --chunk-kb "$CHUNK_KB" \
         --latency-iterations "$LATENCY_ITERS" \
         --connections "$CONNECTIONS" \
-        --timeout-seconds "$TRANSFER_TIMEOUT_SECONDS" > "$result_file" \
-        || echo "  ❌ Benchmark failed"
+        --timeout-seconds "$TRANSFER_TIMEOUT_SECONDS" > "$result_file"
+    local py_status=$?
+    [ "$py_status" = "0" ] || echo "  ❌ Benchmark failed"
     cat "$result_file"
 
     TP_VAL=$(grep 'MB/s' "$result_file" | awk -F': ' '/Throughput/ {print $2}' | awk '{print $1}' | head -1)
     LAT_VAL=$(grep 'median RTT' "$result_file" | awk -F': ' '/Latency/ {print $2}' | awk '{print $1}' | head -1)
-    rm -f "$result_file"
-
-    echo ""
-    cleanup 2>/dev/null
-    [ -n "$TP_VAL" ] || return 1
+    # A failed run still prints "Throughput: 0.00 MB/s", so a zero throughput
+    # counts as a failure too — otherwise the retry path never runs.
+    [ "$py_status" = "0" ] || return 1
+    case "$TP_VAL" in ""|0|0.0|0.00) return 1 ;; esac
     return 0
 }
 
@@ -338,6 +395,11 @@ check_load
 # ═══════════════════════════════════════════════════════════════════════
 # Build check
 # ═══════════════════════════════════════════════════════════════════════
+if [ "$BENCH_KEEP_LOGS" = "1" ] && [ -n "$BENCH_LOG_DIR" ]; then
+    rm -rf "$BENCH_LOG_DIR"
+    mkdir -p "$BENCH_LOG_DIR" || BENCH_KEEP_LOGS=0
+fi
+
 echo "Checking binaries..."
 echo "  Go server:           $([ -x "$GO_SERVER" ] && echo '✓' || echo '✗ (will skip)')"
 echo "  Go client:           $([ -x "$GO_CLIENT" ] && echo '✓' || echo '✗ (will skip)')"

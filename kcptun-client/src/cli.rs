@@ -47,6 +47,8 @@ pub(crate) struct Config {
     pub streambuf: Option<usize>,
     pub framesize: Option<usize>,
     pub keepalive: Option<i64>,
+    pub keepalivetimeout: Option<i64>,
+    pub ackstalltimeout: Option<i64>,
     pub closewait: Option<i64>,
     pub snmplog: Option<String>,
     pub snmpperiod: Option<i64>,
@@ -178,9 +180,25 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub framesize: Option<usize>,
 
-    /// SMUX keepalive interval in seconds.
-    #[arg(long)]
+    /// SMUX keepalive interval in seconds: how often a keepalive (NOP) frame is
+    /// sent when the session is idle. 0 disables keepalives.
+    #[arg(long, default_value = "10")]
     pub keepalive: Option<i64>,
+
+    /// SMUX keepalive timeout in seconds: how long the session may go without a
+    /// single inbound frame before it is declared dead (0 disables the check).
+    /// Go keeps this at 30; on a lossy path a longer value rides out a transient
+    /// dropout instead of tearing down every stream on the session.
+    #[arg(long, default_value = "30")]
+    pub keepalivetimeout: Option<i64>,
+
+    /// Ack-stall timeout in seconds: how long outbound data may stay
+    /// unacknowledged before the session is declared desynchronised. The fast
+    /// path needs evidence that the peer restarted its KCP; without it only
+    /// 60s of no ACK progress closes the session, so plain loss on the outbound
+    /// path is left to KCP retransmission. 0 disables the check.
+    #[arg(long, default_value = "10")]
+    pub ackstalltimeout: Option<i64>,
 
     /// Close wait timeout in seconds.
     #[arg(long)]
@@ -264,6 +282,8 @@ impl Cli {
             streambuf: cfg.streambuf.or(cli.streambuf),
             framesize: cfg.framesize.or(cli.framesize),
             keepalive: cfg.keepalive.or(cli.keepalive),
+            keepalivetimeout: cfg.keepalivetimeout.or(cli.keepalivetimeout),
+            ackstalltimeout: cfg.ackstalltimeout.or(cli.ackstalltimeout),
             closewait: cfg.closewait.or(cli.closewait),
             snmplog: cfg.snmplog.or(cli.snmplog),
             snmpperiod: cfg.snmpperiod.or(cli.snmpperiod),

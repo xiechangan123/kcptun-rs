@@ -43,7 +43,16 @@ impl SmuxIo {
 
     /// Shared `poll_write` logic.
     #[inline]
-    fn do_poll_write(&mut self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn do_poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        // Write-side flow control belongs to the stream's window even though
+        // backpressure on the *transport* lives in `KcpStream`: the stream's
+        // send buffer is where a fast producer with a slow consumer would
+        // otherwise accumulate without bound (Go's `writeV2` blocks the caller
+        // on the same window). The client and server pipes write through this
+        // path, so it must not bypass `Stream::poll_send_capacity`.
+        if self.stream.poll_send_capacity(cx).is_pending() {
+            return Poll::Pending;
+        }
         match self.stream.write(buf) {
             Ok(n) => {
                 self.flush_notify.notify_one();
@@ -105,5 +114,45 @@ impl knet::AsyncWrite for SmuxIo {
         this.stream.mark_local_closed();
         this.flush_notify.notify_one();
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::task::Waker;
+
+    /// The client and server pipes write through `SmuxIo`, so this path must
+    /// apply the peer's window like `Stream` does. Regression: it used to
+    /// bypass the check entirely, buffering everything a fast producer handed
+    /// it (20 MB on one stream whose peer had consumed 1.2 MB).
+    #[test]
+    fn smux_io_write_blocks_at_the_peer_window() {
+        let stream = Arc::new(Stream::with_buffer(1, 2 * 1024 * 1024));
+        stream.apply_peer_update(0, 32 * 1024);
+        let mut io = SmuxIo::new(stream.clone(), Arc::new(knet::Notify::new()));
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let chunk = vec![b'x'; 8 * 1024];
+
+        for _ in 0..4 {
+            assert!(matches!(
+                io.do_poll_write(&mut cx, &chunk),
+                Poll::Ready(Ok(_))
+            ));
+        }
+        assert_eq!(stream.pending_send(), 32 * 1024);
+
+        // The buffer holds the peer's whole window: the pipe parks here.
+        assert!(matches!(io.do_poll_write(&mut cx, &chunk), Poll::Pending));
+
+        // Flush drains it and the peer reports it consumed the data.
+        let mut out = bytes::BytesMut::new();
+        assert_eq!(stream.drain_send_max(&mut out, usize::MAX), 32 * 1024);
+        stream.apply_peer_update(32 * 1024, 32 * 1024);
+        assert!(matches!(
+            io.do_poll_write(&mut cx, &chunk),
+            Poll::Ready(Ok(_))
+        ));
     }
 }

@@ -24,6 +24,10 @@ use parking_lot::Mutex;
 const POOL_BUF_SIZE: usize = 16384;
 /// Maximum pooled buffers per stream to avoid unbounded growth.
 const POOL_MAX_BUFFERS: usize = 8;
+/// Writer-side bound used when the peer advertises no usable window, i.e. a v1
+/// stream (v1 has no per-stream window on the wire). Matches Go's
+/// `initialPeerWindow`.
+const MIN_SEND_BUFFER: usize = 262_144;
 
 /// A lightweight buffer pool for SMUX stream data chunks.
 ///
@@ -623,6 +627,8 @@ impl Stream {
             self.send_buf_bytes.fetch_sub(drained, Ordering::Relaxed);
             self.bytes_written
                 .fetch_add(drained as u32, Ordering::Relaxed);
+            // Space freed for a writer blocked on `send_buffer_limit`.
+            self.wakeup_writer();
         }
         drained
     }
@@ -769,6 +775,55 @@ impl Stream {
         }
     }
 
+    /// Bytes this stream may keep buffered for the peer before the writer blocks.
+    ///
+    /// The bound is the peer's remaining window — its advertised window minus
+    /// what is already on the wire. That is Go's `writeV2` rule (`win > 0` is
+    /// required before anything is transmitted) expressed for an architecture
+    /// that buffers before the flush loop drains it. Without it a fast producer
+    /// with a slow or stalled consumer buffers without bound: measured on the
+    /// live path at 178 MB RSS from ten streams in 25 s on a 512 MB box, which
+    /// stalls the far end long enough for its peer's 30 s silence watchdog to
+    /// close the session.
+    ///
+    /// v1 has no per-stream window on the wire, so the stream's own configured
+    /// buffer size is the bound, floored at Go's initial window.
+    pub fn send_buffer_limit(&self) -> usize {
+        let peer_win = self.peer_send_window();
+        if peer_win == u32::MAX {
+            return self.max_recv_buf.max(MIN_SEND_BUFFER);
+        }
+        peer_win as usize
+    }
+
+    /// Whether the send buffer already holds everything the peer can take.
+    #[inline]
+    fn send_buffer_full(&self) -> bool {
+        self.pending_send() >= self.send_buffer_limit()
+    }
+
+    /// Poll whether the writer may enqueue more data.
+    ///
+    /// `Ready` while the send buffer is below [`Self::send_buffer_limit`].
+    /// Otherwise a waker is registered and `Pending` is returned; the flush loop
+    /// ([`Self::drain_send_max`]) and window updates ([`Self::apply_peer_update`])
+    /// wake it once there is room again.
+    ///
+    /// Both write paths gate on this: `Stream`'s own `AsyncWrite` impl and
+    /// `SmuxIo`, which is what the client and server pipes actually use.
+    pub fn poll_send_capacity(&self, cx: &Context<'_>) -> Poll<()> {
+        if !self.send_buffer_full() {
+            return Poll::Ready(());
+        }
+        self.register_write_waker(cx.waker().clone());
+        // Re-check after registering (lost-wakeup race).
+        if self.send_buffer_full() {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
+
     /// Get pending UPD state and reset the flag.
     pub fn take_upd(&self) -> Option<(u32, u32)> {
         if self.pending_upd.swap(false, Ordering::Acquire) {
@@ -891,14 +946,12 @@ impl knet::AsyncWrite for Stream {
                 "SMUX stream closed",
             )));
         }
-        // v2 write-side flow control: block when peer window is full.
-        let peer_win = self.peer_send_window();
-        if peer_win == 0 {
-            self.register_write_waker(cx.waker().clone());
-            // Re-check after registering waker (lost-wakeup race).
-            if self.peer_send_window() == 0 {
-                return Poll::Pending;
-            }
+        // Write-side flow control: block while the peer's window is exhausted
+        // or the send buffer already holds what the peer can take. Producers
+        // must never outrun the consumer's window, or the buffer grows without
+        // bound (see `send_buffer_limit`).
+        if self.poll_send_capacity(cx).is_pending() {
+            return Poll::Pending;
         }
         match self.write(buf) {
             Ok(n) => {
@@ -1091,6 +1144,54 @@ mod tests {
         assert_eq!(stream.drain_send_max(&mut out, 64), 5);
         assert_eq!(stream.bytes_written.load(Ordering::Relaxed), 5);
         assert_eq!(&out[..], b"world");
+    }
+
+    /// A writer must stop once the send buffer holds everything the peer can
+    /// take, and resume when the peer reports consumption. Regression: the
+    /// buffer used to be unbounded (`SmuxIo` never consulted the window), which
+    /// is how a 512 MB server ended up buffering hundreds of MB and stalling.
+    #[test]
+    fn writer_blocked_by_the_peer_window_resumes_after_consumption() {
+        let stream = Stream::with_buffer(1, 2 * 1024 * 1024);
+        stream.apply_peer_update(0, 64 * 1024);
+        let waker = Waker::noop();
+        let cx = Context::from_waker(waker);
+        let chunk = vec![b'x'; 16 * 1024];
+
+        for _ in 0..4 {
+            assert!(stream.poll_send_capacity(&cx).is_ready());
+            stream.write(&chunk).unwrap();
+        }
+        assert_eq!(stream.pending_send(), 64 * 1024);
+        // The peer's whole window is buffered: no further writes.
+        assert!(stream.poll_send_capacity(&cx).is_pending());
+
+        // Draining puts it on the wire, which moves the window to in-flight.
+        let mut out = BytesMut::new();
+        assert_eq!(stream.drain_send_max(&mut out, usize::MAX), 64 * 1024);
+        assert!(stream.poll_send_capacity(&cx).is_pending());
+
+        // Peer consumed it → the writer may send another window's worth.
+        stream.apply_peer_update(64 * 1024, 64 * 1024);
+        assert!(stream.poll_send_capacity(&cx).is_ready());
+    }
+
+    /// v1 has no per-stream window on the wire, so the stream's own configured
+    /// buffer bounds the writer (floored at Go's initial window).
+    #[test]
+    fn v1_writer_is_bounded_by_the_stream_buffer() {
+        let stream = Stream::with_buffer(1, 64 * 1024);
+        stream.disable_peer_window();
+        assert_eq!(stream.send_buffer_limit(), MIN_SEND_BUFFER);
+
+        let waker = Waker::noop();
+        let cx = Context::from_waker(waker);
+        let chunk = vec![b'x'; 16 * 1024];
+        for _ in 0..(MIN_SEND_BUFFER / chunk.len()) {
+            assert!(stream.poll_send_capacity(&cx).is_ready());
+            stream.write(&chunk).unwrap();
+        }
+        assert!(stream.poll_send_capacity(&cx).is_pending());
     }
 
     #[test]

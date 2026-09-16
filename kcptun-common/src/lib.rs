@@ -42,7 +42,7 @@ pub use kcp_config::{
 #[cfg(feature = "tokio")]
 pub use kcp_transport::CryptoTransport;
 #[cfg(feature = "tokio")]
-pub use kcptun_session::{KcptunConfig, KcptunSession};
+pub use kcptun_session::{ACK_STALL_DEFAULT_SECS, KcptunConfig, KcptunSession};
 #[cfg(feature = "tokio")]
 pub use pipe::pipe;
 #[cfg(feature = "tokio")]

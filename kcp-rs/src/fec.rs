@@ -462,11 +462,21 @@ impl FecDecoder {
 
         // Check if packet type matches expected FEC parameters
         let idx_in_shard = seqid % self.shard_size as u32;
-        if idx_in_shard < self.data_shards as u32 {
-            if flag != FEC_TYPE_DATA {
-                self.should_tune = true;
+        let mismatched = if idx_in_shard < self.data_shards as u32 {
+            flag != FEC_TYPE_DATA
+        } else {
+            flag != FEC_TYPE_PARITY
+        };
+        if mismatched {
+            if !self.should_tune {
+                // PROBE: the only path that drops *everything* while it lasts.
+                log::warn!(
+                    "FEC tune triggered: seqid={seqid} flag={flag} idx_in_shard={idx_in_shard} ds={} ps={} (samples={})",
+                    self.data_shards,
+                    self.parity_shards,
+                    self.auto_tune.pulses.len()
+                );
             }
-        } else if flag != FEC_TYPE_PARITY {
             self.should_tune = true;
         }
 
@@ -474,6 +484,12 @@ impl FecDecoder {
         if self.should_tune {
             let auto_ds = self.auto_tune.find_period(true, self.paws);
             let auto_ps = self.auto_tune.find_period(false, self.paws);
+            log::debug!(
+                "FEC tune probe: auto_ds={auto_ds} auto_ps={auto_ps} current={}/{} samples={}",
+                self.data_shards,
+                self.parity_shards,
+                self.auto_tune.pulses.len()
+            );
             if auto_ds > 0 && auto_ps > 0 && auto_ds + auto_ps < 256 {
                 if auto_ds != self.data_shards || auto_ps != self.parity_shards {
                     // Build all replacement state before swapping dimensions. If
@@ -501,6 +517,10 @@ impl FecDecoder {
                 // pays the parity bandwidth. One stale or injected packet is
                 // enough to set the flag.
                 self.should_tune = false;
+            } else {
+                log::warn!(
+                    "FEC tune could not resolve (auto_ds={auto_ds} auto_ps={auto_ps}) — still dropping every packet"
+                );
             }
             return Vec::new();
         }

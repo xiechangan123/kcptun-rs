@@ -16,6 +16,14 @@ const INPUT_BATCH_GROW: usize = 16;
 /// + deferred flush so a high-rate peer cannot starve the worker (v3 §5.4).
 const MAX_INPUT_BATCH: usize = 64;
 
+/// A session must have received at least this many in-order segments before a
+/// segment numbered 0 counts as a *new generation* rather than a duplicate of
+/// its own first segment (see the sequence-restart check in
+/// `input_with_optional_conv`). A stale session that a re-dial landed on has
+/// received thousands; a session racing its own first datagrams has received a
+/// handful.
+pub(crate) const RESTART_MIN_RCV_NXT: u32 = 16;
+
 pub struct SharedIoState {
     pub(crate) transport: Arc<dyn PacketTransport>,
     pub(crate) kcp: Arc<Mutex<KCP>>,
@@ -47,6 +55,20 @@ pub struct SharedIoState {
     pub(crate) cancel_token: CancellationToken,
     /// Adopt the conversation ID from the first decrypted KCP segment.
     pub(crate) adopt_conv: AtomicBool,
+    /// Datagrams that decrypted fine but carried a different conversation ID.
+    ///
+    /// That is not garbage (the AEAD passed) — it is the peer talking to a
+    /// *different* conversation from this address, i.e. it re-dialed and reused
+    /// its source port. The listener evicts the stale session on this signal
+    /// instead of swallowing the new one.
+    pub(crate) conv_mismatch: AtomicU64,
+    /// Counted when a session that has already delivered data receives the
+    /// first segment of a *new* peer KCP (see [`RESTART_MIN_RCV_NXT`]).
+    ///
+    /// Same address, same conv, different generation: the peer re-dialed and
+    /// reused its source port, so the listener evicts this stale session
+    /// instead of feeding the new conversation into it.
+    pub(crate) peer_restart: AtomicU64,
     /// When false, no background input-loop task is spawned: an external
     /// driver (Acceptor + Worker sharding) feeds inbound via [`KcpStream::feed_input`].
     pub(crate) background_input: bool,
@@ -191,7 +213,7 @@ impl SharedIoState {
 
     /// Milliseconds since the last inbound datagram.
     #[inline]
-    fn rx_age_ms(&self) -> u64 {
+    pub(crate) fn rx_age_ms(&self) -> u64 {
         knet::mono_ms().saturating_sub(self.last_rx_ms.load(Ordering::Relaxed))
     }
 
@@ -851,9 +873,31 @@ pub(crate) fn input_with_optional_conv(
         return false;
     }
     if !shared.adopt_conv.load(Ordering::Acquire) {
-        return kcp
-            .input_no_flush_typed(input, regular, shared.acknodelay.load(Ordering::Acquire))
-            .is_ok();
+        // Sequence-number restart: a fresh peer KCP starts at sn = 0 with
+        // una = 0 (it has received nothing from us yet) and cannot legitimately
+        // go back there on a session that already delivered data — ACKs are
+        // cumulative, so a peer whose segment 0 arrived will not retransmit it.
+        //
+        // The `rcv_nxt` floor is what keeps the signal honest: a *brand-new*
+        // session racing its own first datagrams can legitimately see sn = 0
+        // twice (the peer retransmits before our ACK arrives, so its una is
+        // still 0), and evicting there desynchronises the peer's sequence space
+        // for no reason. A stale session fed by the previous generation moved
+        // past this floor long ago (observed: thousands).
+        // KCP header: conv(4) cmd(1) frg(1) wnd(2) ts(4) sn(4) una(4) len(4).
+        if input.len() >= 20 && kcp.rcv_nxt() >= RESTART_MIN_RCV_NXT {
+            let sn = u32::from_le_bytes(input[12..16].try_into().unwrap_or([0; 4]));
+            let una = u32::from_le_bytes(input[16..20].try_into().unwrap_or([0; 4]));
+            if sn == 0 && una == 0 {
+                shared.peer_restart.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let result =
+            kcp.input_no_flush_typed(input, regular, shared.acknodelay.load(Ordering::Acquire));
+        if matches!(result, Err(crate::kcp::KcpError::ConvMismatch { .. })) {
+            shared.conv_mismatch.fetch_add(1, Ordering::Relaxed);
+        }
+        return result.is_ok();
     }
 
     let configured = kcp.conv();

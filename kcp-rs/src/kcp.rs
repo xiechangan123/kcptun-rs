@@ -236,7 +236,12 @@ impl KCP {
             snd_wnd: KCP_DEFAULT_WND,
             rcv_wnd: KCP_DEFAULT_WND,
             rmt_wnd: KCP_DEFAULT_WND,
-            cwnd: KCP_DEFAULT_WND, // Go: 0, but we follow C KCP (ikcp_create sets cwnd = IKCP_WND_SND)
+            cwnd: KCP_DEFAULT_WND, // Diverges from both references: Go `NewKCP` and C
+            // `ikcp_create` (kcp/ikcp.c:250) both start at 0,
+            // i.e. slow start from 1 segment. Only observable
+            // with `--nc 0` (nocwnd == 0); every kcptun `--mode`
+            // preset uses nc=1, where cwnd is ignored. Changing
+            // it alters `--nc 0` startup and needs a bench.
             ssthresh: KCP_THRESHOLD_INIT,
             mss: mtu.saturating_sub(KCP_OVERHEAD as u32),
             mtu,
@@ -776,6 +781,13 @@ impl KCP {
                     // Window check: only ack if within window
                     if itimediff(sn, self.rcv_nxt.wrapping_add(self.rcv_wnd)) < 0 {
                         self.ack_push(sn, ts);
+                        // Go keeps `repeat` true unless `parse_data` rejects the
+                        // segment, so a duplicate below `rcv_nxt` — the common
+                        // case for a retransmission that arrives after the
+                        // original was delivered — is still counted. Counting
+                        // only the in-window branch left RepeatSegs blind to
+                        // exactly the retransmissions it exists to measure.
+                        let mut repeat = true;
                         if itimediff(sn, self.rcv_nxt) >= 0 {
                             // Create segment from received data
                             let mut seg = self.pool.acquire();
@@ -793,10 +805,11 @@ impl KCP {
                             }
 
                             // Insert into receive buffer (matching Go parse_data).
-                            // Go increments RepeatSegs for regular duplicates only.
-                            if self.parse_data(seg) && regular {
-                                snmp::add(&DEFAULT_SNMP.repeat_segs, 1);
-                            }
+                            repeat = self.parse_data(seg);
+                        }
+                        // Go increments RepeatSegs for regular packets only.
+                        if repeat && regular {
+                            snmp::add(&DEFAULT_SNMP.repeat_segs, 1);
                         }
                     }
                 }
@@ -1477,6 +1490,15 @@ impl KCP {
 
     /// Get next sequence number.
     #[inline]
+    /// Next sequence number this KCP expects to receive.
+    ///
+    /// Zero means nothing has been received yet; anything above zero means the
+    /// peer's sequence space is already open, so a later segment numbered 0 can
+    /// only come from a *restarted* peer KCP (sequence numbers never wrap back).
+    pub fn rcv_nxt(&self) -> u32 {
+        self.rcv_nxt
+    }
+
     pub fn snd_nxt(&self) -> u32 {
         self.snd_nxt
     }

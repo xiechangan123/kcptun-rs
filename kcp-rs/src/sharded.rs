@@ -1286,7 +1286,22 @@ async fn process_batch(
             sessions.get(&peer).cloned()
         };
         if let Some(conn) = existing {
-            let _ = conn.feed_raw_single(data);
+            if conn.is_closed() || conn.is_dead() {
+                worker.sessions.lock().remove(&peer);
+                conn.close();
+            } else {
+                let before_mismatch = conn.conv_mismatch_count();
+                let before_restart = conn.peer_restart_count();
+                let _ = conn.feed_raw_single(data);
+                if stale_peer_signal(&conn, 1, before_mismatch, before_restart) {
+                    // Same stale-session case as the batch path.
+                    log::warn!(
+                        "listener: evicting stale session for {peer}: the peer re-dialed on the same address (this session belongs to the previous generation)"
+                    );
+                    worker.sessions.lock().remove(&peer);
+                    conn.close();
+                }
+            }
         } else {
             process_session(
                 worker,
@@ -1378,9 +1393,33 @@ async fn process_session(
     };
 
     if let Some(conn) = existing {
-        // Session exists — feed the batch directly.
-        let _ = conn.feed_raw_batch(datagrams);
-        return;
+        if conn.is_closed() || conn.is_dead() {
+            // Stale map entry: the session is already down but has not been
+            // reaped yet, so this peer's traffic belongs to a fresh dial.
+            worker.sessions.lock().remove(peer);
+            conn.close();
+        } else {
+            // Feed the batch while watching for conversation-ID mismatches.
+            // Datagrams that decrypt (so they are genuinely from this peer)
+            // but carry a different conv mean the peer re-dialed and reused
+            // its source port: this session is the stale one. Feeding it would
+            // swallow the new conversation indefinitely — the peer sees a link
+            // that is up but answers nothing, and closes it after 30s of
+            // "silence" that never happened on the wire.
+            let batch_len = datagrams.len() as u64;
+            let before_mismatch = conn.conv_mismatch_count();
+            let before_restart = conn.peer_restart_count();
+            let _ = conn.feed_raw_batch(datagrams);
+            if batch_len > 0 && stale_peer_signal(&conn, batch_len, before_mismatch, before_restart)
+            {
+                log::warn!(
+                    "listener: evicting stale session for {peer}: the peer re-dialed on the same address (this session belongs to the previous generation)"
+                );
+                worker.sessions.lock().remove(peer);
+                conn.close();
+            }
+            return;
+        }
     }
 
     // No session — check if already building.
@@ -1492,6 +1531,22 @@ async fn process_session(
     // the connection on drop — detach ownership so the connection stays
     // alive until the last clone drops.
     conn.detach_owner();
+}
+
+/// Whether a burst proves the session in the map is a *previous generation* of
+/// this peer: every datagram belonged to another conversation (conv mismatch),
+/// or the whole burst started a new sequence space (peer restart).
+///
+/// Both signals require an authentic datagram (the AEAD passed), so a spoofer
+/// cannot use them to evict a healthy session.
+fn stale_peer_signal(
+    conn: &KcpStream,
+    batch_len: u64,
+    before_mismatch: u64,
+    before_restart: u64,
+) -> bool {
+    conn.conv_mismatch_count().saturating_sub(before_mismatch) >= batch_len
+        || conn.peer_restart_count().saturating_sub(before_restart) >= batch_len
 }
 
 /// Decrypt a burst in place and drop every datagram that fails the transport's

@@ -1218,7 +1218,6 @@ mod tests {
         assert!(s.is_fin_sent(), "FIN should now be marked as sent");
     }
 
-    #[test]
     /// Regression: a stream created via `open_stream` + `queue_syn` can hold
     /// queued data BEFORE the session's next `prepare_outbound` runs. The SYN
     /// and the data must reach the wire in SYN-first order — a PSH that

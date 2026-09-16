@@ -78,6 +78,11 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
     let streambuf = cli.streambuf;
     let framesize = cli.framesize;
     let keepalive = cli.keepalive.unwrap_or(10);
+    let keepalivetimeout = cli.keepalivetimeout.unwrap_or(30).max(0) as u64;
+    let ackstalltimeout = cli
+        .ackstalltimeout
+        .unwrap_or(kcptun_common::ACK_STALL_DEFAULT_SECS as i64)
+        .max(0) as u64;
     let ratelimit_val = cli.ratelimit;
     let close_wait_val = cli.closewait.unwrap_or(30).max(0) as u64;
     let quiet = cli.quiet;
@@ -111,6 +116,25 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
     info!(
         "key derived: crypt={}, key={:02x}..{:02x}",
         crypt_method, key[0], key[31]
+    );
+    info!(
+        "session watchdog: ack-stall window={}s ({}), fast path needs peer-restart evidence",
+        ackstalltimeout,
+        if ackstalltimeout == 0 {
+            "disabled"
+        } else {
+            "closes after that much unacknowledged outbound data"
+        }
+    );
+    info!(
+        "smux keepalive: interval={}s timeout={}s ({})",
+        keepalive.max(0),
+        keepalivetimeout,
+        if keepalivetimeout == 0 {
+            "timeout check disabled"
+        } else {
+            "session closed after that much inbound silence"
+        }
     );
 
     // Bind listen address(es) — multi-port "host:min-max" matches Go ParseMultiPort.
@@ -149,7 +173,7 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
         max_frame_size: framesize,
         keepalive_interval: keepalive.max(0) as u64,
         // Go's BuildSmuxConfig changes only the interval; timeout remains 30s.
-        keepalive_timeout: 30,
+        keepalive_timeout: keepalivetimeout,
     };
     let session_config = kcptun_common::KcptunConfig {
         kcp: kcp_config,
@@ -157,6 +181,7 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
         nocomp,
         rate_limit: ratelimit_val,
         offload_profile: kcrypt_rs::OffloadProfile::Tokio,
+        ack_stall_secs: ackstalltimeout,
     };
 
     // TCP mode: additionally accept raw TCP connections alongside the

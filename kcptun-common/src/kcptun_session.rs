@@ -1,7 +1,7 @@
 //! Shared kcptun session above the encrypted KCP transport.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +20,14 @@ pub struct KcptunConfig {
     pub nocomp: bool,
     pub rate_limit: u32,
     pub offload_profile: OffloadProfile,
+    /// How long outbound data may stay unacknowledged before the session is
+    /// declared desynchronised (seconds; 0 disables the check).
+    ///
+    /// Only applies once the peer's KCP restart signal has been observed; with
+    /// no such evidence a frozen `snd_una` is indistinguishable from plain loss
+    /// on our outbound path, and closing there kills a session whose only fault
+    /// is the network.
+    pub ack_stall_secs: u64,
 }
 
 /// Shared client/server session composition: KCP transport + Snappy + SMUX.
@@ -32,11 +40,70 @@ pub struct KcptunSession {
     flush_notify: Arc<knet::Notify>,
     dead: Arc<AtomicBool>,
     created_ms: u64,
+    /// Live state of the session's three pumps (inbound timestamp, outbound
+    /// timestamps, parked/blocked flags). A silent session has to distinguish
+    /// "the peer sent nothing" from "our own pump is parked" — identical on the
+    /// wire, opposite conclusions.
+    out_state: Arc<OutState>,
+    _handles: Vec<knet::JoinHandle<()>>,
+}
+
+/// Live state of this session's outbound and inbound pumps.
+///
+/// Sampled by the watchdog so a close states *why* the session went quiet:
+/// a peer that stopped sending, or a local pump that is parked (which is not a
+/// network problem at all and must not be mistaken for one).
+struct OutState {
     /// Last successful KCP read (inbound datagram). Distinct from
     /// `kcp.last_activity_ms`, which is also stamped on writes — after a
     /// server restart the writer keeps stamping while the peer is gone.
-    last_inbound_ms: Arc<std::sync::atomic::AtomicU64>,
-    _handles: Vec<knet::JoinHandle<()>>,
+    last_inbound_ms: AtomicU64,
+    /// Monotonic ms of the last successful `kcp.write_all`.
+    last_out_ms: AtomicU64,
+    /// Monotonic ms the writer entered a blocking `kcp.write_all` (0 = free).
+    write_blocked_since: AtomicU64,
+    /// Monotonic ms the reader parked waiting for SMUX receive capacity.
+    read_parked_since: AtomicU64,
+}
+
+impl OutState {
+    fn new() -> Self {
+        Self {
+            last_inbound_ms: AtomicU64::new(knet::mono_ms()),
+            last_out_ms: AtomicU64::new(knet::mono_ms()),
+            write_blocked_since: AtomicU64::new(0),
+            read_parked_since: AtomicU64::new(0),
+        }
+    }
+
+    /// Enter/leave the blocking write. Returns how long the previous block lasted.
+    fn begin_write(&self) {
+        self.write_blocked_since
+            .store(knet::mono_ms().max(1), Ordering::Release);
+    }
+
+    fn end_write(&self) {
+        self.write_blocked_since.store(0, Ordering::Release);
+        self.last_out_ms.store(knet::mono_ms(), Ordering::Release);
+    }
+
+    fn blocked_ms(&self, now: u64) -> u64 {
+        let since = self.write_blocked_since.load(Ordering::Acquire);
+        if since == 0 {
+            0
+        } else {
+            now.saturating_sub(since)
+        }
+    }
+
+    fn parked_ms(&self, now: u64) -> u64 {
+        let since = self.read_parked_since.load(Ordering::Acquire);
+        if since == 0 {
+            0
+        } else {
+            now.saturating_sub(since)
+        }
+    }
 }
 
 impl KcptunSession {
@@ -65,6 +132,7 @@ impl KcptunSession {
             config.nocomp,
             0,
             true,
+            config.ack_stall_secs,
         )
     }
 
@@ -93,7 +161,7 @@ impl KcptunSession {
         .await?;
         let smux = Arc::new(smux_rs::Session::new_server(&config.smux)?);
         smux.enable_accept();
-        Self::new(kcp, smux, config.nocomp, 0, false)
+        Self::new(kcp, smux, config.nocomp, 0, false, config.ack_stall_secs)
     }
 
     /// Start a client-side session over an established KCP connection.
@@ -104,6 +172,7 @@ impl KcptunSession {
             config.nocomp,
             config.rate_limit,
             true,
+            config.ack_stall_secs,
         )
     }
 
@@ -111,7 +180,14 @@ impl KcptunSession {
     pub fn server(kcp: kcp_rs::KcpStream, config: &KcptunConfig) -> Result<Self> {
         let smux = Arc::new(smux_rs::Session::new_server(&config.smux)?);
         smux.enable_accept();
-        Self::new(kcp, smux, config.nocomp, config.rate_limit, false)
+        Self::new(
+            kcp,
+            smux,
+            config.nocomp,
+            config.rate_limit,
+            false,
+            config.ack_stall_secs,
+        )
     }
 
     /// Start a server session whose packet transport already applies the
@@ -122,7 +198,7 @@ impl KcptunSession {
     ) -> Result<Self> {
         let smux = Arc::new(smux_rs::Session::new_server(&config.smux)?);
         smux.enable_accept();
-        Self::new(kcp, smux, config.nocomp, 0, false)
+        Self::new(kcp, smux, config.nocomp, 0, false, config.ack_stall_secs)
     }
 
     fn new(
@@ -131,13 +207,18 @@ impl KcptunSession {
         nocomp: bool,
         rate_limit: u32,
         active_open: bool,
+        ack_stall_secs: u64,
     ) -> Result<Self> {
         let kcp = Arc::new(kcp);
         let flush_notify = Arc::new(knet::Notify::new());
         let dead = Arc::new(AtomicBool::new(false));
-        let compressor = Arc::new(Mutex::new(snap::write::FrameEncoder::new(Vec::new())));
+        // `None` when compression is disabled: keeps the "configured" state in
+        // one handle instead of a parallel flag the loop has to re-check.
+        let compressor =
+            (!nocomp).then(|| Arc::new(Mutex::new(snap::write::FrameEncoder::new(Vec::new()))));
         let limiter = Arc::new(RateLimiter::new(rate_limit));
-        let last_inbound_ms = Arc::new(std::sync::atomic::AtomicU64::new(knet::mono_ms()));
+        let out_state = Arc::new(OutState::new());
+        let ack_stall_ms = ack_stall_secs.saturating_mul(1000);
         let handles = vec![
             knet::spawn_task(read_loop(
                 kcp.clone(),
@@ -145,7 +226,7 @@ impl KcptunSession {
                 flush_notify.clone(),
                 dead.clone(),
                 nocomp,
-                last_inbound_ms.clone(),
+                out_state.clone(),
             )),
             knet::spawn_task(write_loop(
                 kcp.clone(),
@@ -154,7 +235,7 @@ impl KcptunSession {
                 flush_notify.clone(),
                 dead.clone(),
                 limiter,
-                nocomp,
+                out_state.clone(),
             )),
             // Independent watchdog: write_loop can block inside kcp.write_all
             // when the peer is gone and the send window fills with unacked
@@ -165,7 +246,8 @@ impl KcptunSession {
                 kcp.clone(),
                 smux.clone(),
                 dead.clone(),
-                last_inbound_ms.clone(),
+                out_state.clone(),
+                ack_stall_ms,
             )),
         ];
         let session = Self {
@@ -174,7 +256,7 @@ impl KcptunSession {
             flush_notify,
             dead,
             created_ms: knet::mono_ms(),
-            last_inbound_ms,
+            out_state,
             _handles: handles,
         };
         kcp_rs::DEFAULT_SNMP.session_opened(active_open);
@@ -266,7 +348,23 @@ impl KcptunSession {
 
     /// Milliseconds since the last inbound KCP datagram.
     pub fn inbound_idle_ms(&self) -> u64 {
-        knet::mono_ms().saturating_sub(self.last_inbound_ms.load(Ordering::Acquire))
+        knet::mono_ms().saturating_sub(self.out_state.last_inbound_ms.load(Ordering::Acquire))
+    }
+
+    /// Milliseconds since this session last got a packet onto the wire.
+    ///
+    /// A session whose outbound age is large while its peer is silent is a
+    /// local stall (a parked writer), not necessarily a dead path — the two
+    /// look identical from the far end, which is why this is reported next to
+    /// the watchdog verdict.
+    pub fn out_idle_ms(&self) -> u64 {
+        knet::mono_ms().saturating_sub(self.out_state.last_out_ms.load(Ordering::Acquire))
+    }
+
+    /// Milliseconds the outbound pump has been parked inside `kcp.write_all`
+    /// (0 = not parked).
+    pub fn write_blocked_ms(&self) -> u64 {
+        self.out_state.blocked_ms(knet::mono_ms())
     }
 
     /// Close KCP, SMUX, and all streams.
@@ -291,7 +389,7 @@ async fn read_loop(
     flush: Arc<knet::Notify>,
     dead: Arc<AtomicBool>,
     nocomp: bool,
-    last_inbound_ms: Arc<std::sync::atomic::AtomicU64>,
+    out_state: Arc<OutState>,
 ) {
     let mut buf = vec![0u8; 64 * 1024];
     let mut decoder = (!nocomp).then(crate::SnappyStreamDecoder::new);
@@ -303,16 +401,69 @@ async fn read_loop(
         // reclaims tokens every cycle as the application reads, so this
         // parks for at most one tick.
         if !smux.has_receive_capacity() {
+            // Diagnostics only: a reader parked here is invisible on the wire
+            // (no ACK progress, no payload) and is a local stall, not loss.
+            let _ = out_state.read_parked_since.compare_exchange(
+                0,
+                knet::mono_ms().max(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
             knet::sleep_ms(10).await;
             continue;
         }
+        {
+            let parked = out_state.read_parked_since.swap(0, Ordering::AcqRel);
+            if parked != 0 {
+                let elapsed = knet::mono_ms().saturating_sub(parked);
+                if elapsed >= READ_PARK_WARN_MS {
+                    log::warn!(
+                        "session read loop was parked {elapsed}ms on SMUX receive capacity (bucket={}), no KCP data pulled",
+                        smux.token_bucket_value()
+                    );
+                }
+            }
+        }
         let n = match kcp.read(&mut buf).await {
-            Ok(0) => break,
+            Ok(0) => {
+                // Silent close paths are indistinguishable from a dead peer in
+                // the logs; state the reason and the transport counters.
+                log::warn!(
+                    "session read loop: KCP EOF (closed={}, dead={}, snd_una={}, wait_send={}, rmt_wnd={}, out_idle_ms={}){}",
+                    kcp.is_closed(),
+                    kcp.is_dead(),
+                    kcp.snd_una(),
+                    kcp.wait_send(),
+                    kcp.rmt_wnd(),
+                    knet::mono_ms().saturating_sub(
+                        out_state.last_out_ms.load(Ordering::Acquire)
+                    ),
+                    kcp.take_error()
+                        .ok()
+                        .flatten()
+                        .map(|e| format!(" last_error={e}"))
+                        .unwrap_or_default()
+                );
+                break;
+            }
             Ok(n) => n,
-            Err(_) if kcp.is_closed() => break,
-            Err(_) => continue,
+            Err(e) if kcp.is_closed() => {
+                log::warn!(
+                    "session read loop: read failed on a closed KCP: {e} (dead={}, snd_una={}, wait_send={})",
+                    kcp.is_dead(),
+                    kcp.snd_una(),
+                    kcp.wait_send()
+                );
+                break;
+            }
+            Err(e) => {
+                log::debug!("session read loop: transient read error: {e}");
+                continue;
+            }
         };
-        last_inbound_ms.store(knet::mono_ms(), Ordering::Release);
+        out_state
+            .last_inbound_ms
+            .store(knet::mono_ms(), Ordering::Release);
         let result = if let Some(decoder) = decoder.as_mut() {
             decoder.feed(&buf[..n]).and_then(|data| {
                 if data.is_empty() {
@@ -347,12 +498,66 @@ async fn read_loop(
 /// `dead_link` only notices after its full retransmission budget (~20
 /// retransmits with RTO backoff) and the idle timeout needs 30 s of complete
 /// silence, so neither recovers a stale session in time.
-const ACK_STALL_MS: u64 = 10_000;
+/// Ack-stall window used when no peer restart has been observed.
+///
+/// A frozen `snd_una` with a live peer has two shapes: the peer's KCP was reset
+/// (seen as a restart signal, and never recoverable) or our outbound data is
+/// being dropped (recoverable by KCP retransmission). Only the first deserves a
+/// fast close; the second gets this much longer window, which still bounds the
+/// unrecoverable "peer silent for us but still talking" case well inside KCP's
+/// own `dead_link` budget.
+const ACK_STALL_NO_RESTART_MS: u64 = 60_000;
+
+/// Ack-stall window to apply for this sample (0 = the check is disabled).
+///
+/// The fast window requires evidence that the peer's KCP was restarted; without
+/// it a frozen `snd_una` is attributed to loss on our outbound path and only the
+/// long grace applies.
+fn stall_window_ms(ack_stall_ms: u64, peer_restarted: bool) -> u64 {
+    if ack_stall_ms == 0 {
+        return 0; // check disabled
+    }
+    if peer_restarted {
+        ack_stall_ms
+    } else {
+        ack_stall_ms.max(ACK_STALL_NO_RESTART_MS)
+    }
+}
 
 /// A stall only counts while the peer is still reachable. During a plain
 /// network outage both directions go quiet at once; there KCP's own
 /// retransmission is the correct recovery and the session must be left alone.
 const ACK_STALL_INBOUND_FRESH_MS: u64 = 5_000;
+
+/// Whether inbound silence is treated as peer death.
+///
+/// Silence is measured at the **SMUX frame** level: no frame decoded for the
+/// keepalive timeout, the same rule Go's smux applies. It is also the useful
+/// one: a peer can keep its KCP acknowledgements flowing while sending no frames
+/// at all — its session write loop blocked on a full send window, so neither
+/// data nor keepalive NOPs leave it — and such a session delivers nothing to the
+/// streams on it, so it must not be kept alive by bare ACKs. `rx_age_ms` is
+/// logged next to the verdict for diagnosis (datagrams flowing while frames are
+/// stale means the peer's writer is stuck), not as a reason to keep the session.
+///
+/// The receive-capacity guard stays: while our own window is drained the peer's
+/// writer is blocked on us, so quiet is expected.
+fn silence_is_fatal(timeout_secs: u64, inbound_age_ms: u64, has_receive_capacity: bool) -> bool {
+    timeout_secs > 0 && inbound_age_ms >= timeout_secs.saturating_mul(1000) && has_receive_capacity
+}
+
+/// Report (once) when the outbound pump has been parked this long inside
+/// `kcp.write_all`. The paired peer sees pure silence, so without this line a
+/// local stall is indistinguishable from packet loss.
+const WRITE_BLOCK_WARN_MS: u64 = 3_000;
+
+/// Report (once) when the inbound pump has been parked this long waiting for
+/// SMUX receive capacity — again, indistinguishable from peer silence on the
+/// wire.
+const READ_PARK_WARN_MS: u64 = 5_000;
+
+/// Default ack-stall window used by `bench/` and the binaries' CLI defaults.
+pub const ACK_STALL_DEFAULT_SECS: u64 = 10;
 
 /// Tracks whether the peer keeps acknowledging outbound data.
 ///
@@ -388,6 +593,7 @@ impl AckStallDetector {
         una: u32,
         inbound_age_ms: u64,
         peer_window_open: bool,
+        threshold_ms: u64,
     ) -> bool {
         if !waiting || !peer_window_open || una != self.last_una {
             self.stalled_since = None;
@@ -396,15 +602,54 @@ impl AckStallDetector {
         }
         self.last_una = una;
         self.stalled_since.is_some_and(|since| {
-            now_ms.saturating_sub(since) >= ACK_STALL_MS
+            now_ms.saturating_sub(since) >= threshold_ms
                 && inbound_age_ms < ACK_STALL_INBOUND_FRESH_MS
         })
     }
 }
 
 #[cfg(test)]
+mod silence_tests {
+    use super::silence_is_fatal;
+
+    /// Nothing (no frames, no payload) for the whole window: a dead session.
+    #[test]
+    fn silence_past_the_timeout_is_fatal() {
+        assert!(silence_is_fatal(90, 90_000, true));
+        assert!(silence_is_fatal(90, 120_000, true));
+    }
+
+    /// Recent frames: alive, including just inside the edge.
+    #[test]
+    fn recent_frames_keep_the_session() {
+        assert!(!silence_is_fatal(90, 400, true));
+        assert!(!silence_is_fatal(90, 89_000, true));
+        assert!(!silence_is_fatal(90, 0, true));
+    }
+
+    /// Our own receive window is drained: the peer's writer is blocked on us, so
+    /// its quiet is self-inflicted. Never fatal.
+    #[test]
+    fn drained_receive_window_keeps_the_session() {
+        assert!(!silence_is_fatal(90, 120_000, false));
+    }
+
+    /// `--keepalivetimeout 0` disables the check entirely.
+    #[test]
+    fn disabled_timeout_keeps_the_session() {
+        assert!(!silence_is_fatal(0, 600_000, true));
+    }
+}
+
+#[cfg(test)]
 mod ack_stall_tests {
-    use super::{AckStallDetector, ACK_STALL_INBOUND_FRESH_MS, ACK_STALL_MS};
+    use super::{
+        stall_window_ms, AckStallDetector, ACK_STALL_DEFAULT_SECS, ACK_STALL_INBOUND_FRESH_MS,
+        ACK_STALL_NO_RESTART_MS,
+    };
+
+    /// The window the tests exercise (the binaries default to this value).
+    const ACK_STALL_MS: u64 = ACK_STALL_DEFAULT_SECS * 1000;
 
     /// Samples arrive every 500 ms in production; the peer is reachable.
     const FRESH: u64 = 200;
@@ -415,12 +660,12 @@ mod ack_stall_tests {
         let mut now = 0;
         while now < ACK_STALL_MS {
             assert!(
-                !det.sample(now, true, 7, FRESH, true),
+                !det.sample(now, true, 7, FRESH, true, ACK_STALL_MS),
                 "fired early at {now}ms"
             );
             now += 500;
         }
-        assert!(det.sample(ACK_STALL_MS, true, 7, FRESH, true));
+        assert!(det.sample(ACK_STALL_MS, true, 7, FRESH, true, ACK_STALL_MS));
     }
 
     #[test]
@@ -430,10 +675,10 @@ mod ack_stall_tests {
         // inbound age grows with the outage, so the reachability check fails
         // even after the stall window has elapsed.
         let mut det = AckStallDetector::new(7);
-        assert!(!det.sample(0, true, 7, 100, true));
-        assert!(!det.sample(5_000, true, 7, 5_100, true));
-        assert!(!det.sample(ACK_STALL_MS, true, 7, 10_100, true));
-        assert!(!det.sample(20_000, true, 7, 20_100, true));
+        assert!(!det.sample(0, true, 7, 100, true, ACK_STALL_MS));
+        assert!(!det.sample(5_000, true, 7, 5_100, true, ACK_STALL_MS));
+        assert!(!det.sample(ACK_STALL_MS, true, 7, 10_100, true, ACK_STALL_MS));
+        assert!(!det.sample(20_000, true, 7, 20_100, true, ACK_STALL_MS));
     }
 
     #[test]
@@ -445,7 +690,7 @@ mod ack_stall_tests {
         let mut now = 0;
         while now <= ACK_STALL_MS * 3 {
             assert!(
-                !det.sample(now, true, 7, FRESH, false),
+                !det.sample(now, true, 7, FRESH, false, ACK_STALL_MS),
                 "fired on flow control at {now}ms"
             );
             now += 500;
@@ -457,28 +702,42 @@ mod ack_stall_tests {
         let mut det = AckStallDetector::new(7);
         for now in (0..6_000).step_by(500) {
             assert!(
-                !det.sample(now, true, 7, FRESH, true),
+                !det.sample(now, true, 7, FRESH, true, ACK_STALL_MS),
                 "fired early at {now}ms"
             );
         }
         // Peer acknowledged more data: the window starts over from here.
-        assert!(!det.sample(6_000, true, 8, FRESH, true));
+        assert!(!det.sample(6_000, true, 8, FRESH, true, ACK_STALL_MS));
         let mut now = 6_500;
         while now < 16_500 {
             assert!(
-                !det.sample(now, true, 8, FRESH, true),
+                !det.sample(now, true, 8, FRESH, true, ACK_STALL_MS),
                 "fired early at {now}ms"
             );
             now += 500;
         }
-        assert!(det.sample(16_500, true, 8, FRESH, true));
+        assert!(det.sample(16_500, true, 8, FRESH, true, ACK_STALL_MS));
     }
 
     #[test]
     fn nothing_in_flight_never_fires() {
         let mut det = AckStallDetector::new(7);
-        assert!(!det.sample(0, false, 7, FRESH, true));
-        assert!(!det.sample(600_000, false, 7, FRESH, true));
+        assert!(!det.sample(0, false, 7, FRESH, true, ACK_STALL_MS));
+        assert!(!det.sample(600_000, false, 7, FRESH, true, ACK_STALL_MS));
+    }
+
+    /// The fast window applies only with restart evidence; without it the long
+    /// grace is used, so loss-induced stalls do not tear the session down.
+    #[test]
+    fn stall_window_requires_restart_evidence_for_the_fast_path() {
+        assert_eq!(stall_window_ms(10_000, true), 10_000);
+        assert_eq!(stall_window_ms(10_000, false), ACK_STALL_NO_RESTART_MS);
+        // A configured value above the grace is respected either way.
+        assert_eq!(stall_window_ms(90_000, false), 90_000);
+        assert_eq!(stall_window_ms(90_000, true), 90_000);
+        // 0 keeps the check disabled.
+        assert_eq!(stall_window_ms(0, true), 0);
+        assert_eq!(stall_window_ms(0, false), 0);
     }
 
     #[test]
@@ -502,26 +761,72 @@ async fn watchdog_loop(
     kcp: Arc<kcp_rs::KcpStream>,
     smux: Arc<smux_rs::Session>,
     dead: Arc<AtomicBool>,
-    last_inbound_ms: Arc<std::sync::atomic::AtomicU64>,
+    out_state: Arc<OutState>,
+    ack_stall_ms: u64,
 ) {
     let mut ack_stall = AckStallDetector::new(kcp.snd_una());
+    let mut write_stall_logged = false;
+    let mut heartbeat = 0u32;
     while !dead.load(Ordering::Acquire) && !smux.is_closed() && !kcp.is_closed() {
         knet::sleep_ms(500).await;
+        // Periodic full state dump (debug): the only way to tell a stalled
+        // *sender* (frozen snd_nxt with data queued) from a stalled *receiver*
+        // (sender fine, peer's rcv_nxt frozen) on the same silent wire.
+        if log::log_enabled!(log::Level::Debug) {
+            heartbeat = heartbeat.wrapping_add(1);
+            if heartbeat.is_multiple_of(4) {
+                log::debug!(
+                    "session state: snd_una={} snd_nxt={} rcv_nxt={} wait_send={} rmt_wnd={} dead={} closed={} | smux(bucket={} streams={}) | out_age_ms={} write_blocked_ms={} read_parked_ms={} | inbound_age_ms={} rx_age_ms={}",
+                    kcp.snd_una(),
+                    kcp.snd_nxt(),
+                    kcp.rcv_nxt(),
+                    kcp.wait_send(),
+                    kcp.rmt_wnd(),
+                    kcp.is_dead(),
+                    kcp.is_closed(),
+                    smux.token_bucket_value(),
+                    smux.stream_count(),
+                    knet::mono_ms().saturating_sub(out_state.last_out_ms.load(Ordering::Acquire)),
+                    out_state.blocked_ms(knet::mono_ms()),
+                    out_state.parked_ms(knet::mono_ms()),
+                    knet::mono_ms().saturating_sub(out_state.last_inbound_ms.load(Ordering::Acquire)),
+                    kcp.rx_age_ms(),
+                );
+            }
+        }
         let now = knet::mono_ms();
         let timeout = smux.keepalive_timeout_secs();
-        let inbound_age = now.saturating_sub(last_inbound_ms.load(Ordering::Acquire));
+        let inbound_age = now.saturating_sub(out_state.last_inbound_ms.load(Ordering::Acquire));
+        // Datagram age is diagnostic only: it says whether the peer's transport
+        // is still talking to us while its frames are missing.
+        let rx_age = kcp.rx_age_ms();
+
         // Same guard as `smux.is_keepalive_timeout()`: while our receive window
         // is drained the peer's writer is blocked on us, so silence is expected.
-        let timed_out = timeout > 0
-            && inbound_age >= timeout.saturating_mul(1000)
-            && smux.has_receive_capacity();
+        let timed_out = silence_is_fatal(timeout, inbound_age, smux.has_receive_capacity());
 
         let una = kcp.snd_una();
         let waiting = kcp.wait_send() > 0;
         // A closed peer window means it is out of buffer space and is choosing
         // not to take more data, so an unacknowledged backlog is flow control.
         let peer_window_open = kcp.rmt_wnd() > 0;
-        let ack_stalled = ack_stall.sample(now, waiting, una, inbound_age, peer_window_open);
+        // A peer that restarted its KCP never accepts our in-flight sequence
+        // range again, so a frozen `snd_una` with a live peer is unrecoverable
+        // and may be acted on at `ack_stall_ms`. Without that evidence the same
+        // picture is produced by plain loss on our outbound path (measured on
+        // the live path: 3-34s downlink dropouts), which KCP retransmission
+        // recovers from, so it gets the long grace instead.
+        let peer_restarted = kcp.peer_restart_count() > 0;
+        let stall_window = stall_window_ms(ack_stall_ms, peer_restarted);
+        let ack_stalled = stall_window > 0
+            && ack_stall.sample(
+                now,
+                waiting,
+                una,
+                inbound_age,
+                peer_window_open,
+                stall_window,
+            );
         if log::log_enabled!(log::Level::Debug) {
             // Only while acknowledgements are actually behind — a bulk transfer
             // keeps data in flight constantly and must not log every tick.
@@ -535,10 +840,29 @@ async fn watchdog_loop(
 
         let kcp_dead = kcp.is_dead();
         let smux_timeout = smux.is_keepalive_timeout();
+        // A locally parked pump produces the same wire picture as a dead peer
+        // (silence), so both have to be visible before drawing conclusions.
+        let write_blocked_ms = out_state.blocked_ms(now);
+        let read_parked_ms = out_state.parked_ms(now);
+        let out_age_ms = now.saturating_sub(out_state.last_out_ms.load(Ordering::Acquire));
+        if write_blocked_ms >= WRITE_BLOCK_WARN_MS && !write_stall_logged {
+            // One line per blocking episode: a long stall would otherwise log
+            // every 500ms tick and bury the restart of the flow.
+            write_stall_logged = true;
+            log::warn!(
+                "session write loop blocked {write_blocked_ms}ms in kcp.write_all (wait_send={}, rmt_wnd={}, snd_una={una}, inbound_age={inbound_age}ms)",
+                kcp.wait_send(),
+                kcp.rmt_wnd()
+            );
+        } else if write_blocked_ms == 0 {
+            write_stall_logged = false;
+        }
         if kcp_dead || smux_timeout || timed_out || ack_stalled {
             log::warn!(
-                "session watchdog: closing (kcp_dead={kcp_dead}, smux_timeout={smux_timeout}, inbound_idle={timed_out}, ack_stalled={ack_stalled}, snd_una={una}, wait_send={})",
-                kcp.wait_send()
+                "session watchdog: closing (kcp_dead={kcp_dead}, smux_timeout={smux_timeout}, inbound_idle={timed_out}, ack_stalled={ack_stalled}, peer_restart_seen={peer_restarted}, snd_una={una}, wait_send={}, rmt_wnd={}, bucket={}, out_age_ms={out_age_ms}, write_blocked_ms={write_blocked_ms}, read_parked_ms={read_parked_ms}, inbound_age_ms={inbound_age}, rx_age_ms={rx_age})",
+                kcp.wait_send(),
+                kcp.rmt_wnd(),
+                smux.token_bucket_value()
             );
             dead.store(true, Ordering::Release);
             smux.close();
@@ -551,11 +875,11 @@ async fn watchdog_loop(
 async fn write_loop(
     kcp: Arc<kcp_rs::KcpStream>,
     smux: Arc<smux_rs::Session>,
-    compressor: Arc<Mutex<snap::write::FrameEncoder<Vec<u8>>>>,
+    compressor: Option<Arc<Mutex<snap::write::FrameEncoder<Vec<u8>>>>>,
     flush: Arc<knet::Notify>,
     dead: Arc<AtomicBool>,
     limiter: Arc<RateLimiter>,
-    nocomp: bool,
+    out_state: Arc<OutState>,
 ) {
     // KCP owns its own event-driven flush loop. Stream writes notify this task
     // directly, so this is only an idle health-check cadence. A 2ms timer per
@@ -619,9 +943,7 @@ async fn write_loop(
 
         let packet: Option<Bytes> = if out.is_empty() {
             None
-        } else if nocomp {
-            Some(out.split().freeze())
-        } else {
+        } else if let Some(compressor) = compressor.as_ref() {
             let plain = out.split().freeze();
             let plain_len = plain.len();
             let encode = {
@@ -639,6 +961,8 @@ async fn write_loop(
             } else {
                 encode()
             })
+        } else {
+            Some(out.split().freeze())
         };
         if let Some(packet) = packet.filter(|p| !p.is_empty()) {
             // Compatibility fallback for callers that provide a pre-built
@@ -651,7 +975,18 @@ async fn write_loop(
                 }
                 knet::sleep(wait).await;
             }
-            if kcp.write_all(&packet).await.is_err() {
+            out_state.begin_write();
+            let write_result = kcp.write_all(&packet).await;
+            out_state.end_write();
+            if let Err(e) = write_result {
+                log::warn!(
+                    "session write loop: kcp.write_all failed: {e} (closed={}, dead={}, snd_una={}, wait_send={}, rmt_wnd={})",
+                    kcp.is_closed(),
+                    kcp.is_dead(),
+                    kcp.snd_una(),
+                    kcp.wait_send(),
+                    kcp.rmt_wnd()
+                );
                 break;
             }
             smux.mark_fins_sent(&fin_ids);
@@ -714,6 +1049,7 @@ mod tests {
             nocomp: false,
             rate_limit: 0,
             offload_profile: OffloadProfile::Tokio,
+            ack_stall_secs: 10,
         };
         let key = b"0123456789abcdef0123456789abcdef";
         let client = KcptunSession::connect(socket_a, addr_b, key, "aes", &session_config)
@@ -794,6 +1130,7 @@ mod goroutine_tests {
                 nocomp: true,
                 rate_limit: 0,
                 offload_profile: OffloadProfile::Tokio,
+                ack_stall_secs: 10,
             };
             let key = b"0123456789abcdef0123456789abcdef";
             let client = KcptunSession::connect(socket_a, addr_b, key, "null", &session_config)
@@ -893,6 +1230,7 @@ mod goroutine_tests {
                 nocomp: true,
                 rate_limit: 0,
                 offload_profile: OffloadProfile::Tokio,
+                ack_stall_secs: 10,
             };
             let key = b"0123456789abcdef0123456789abcdef";
             let client = Arc::new(

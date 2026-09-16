@@ -136,6 +136,11 @@ pub(crate) async fn async_main() -> Result<()> {
     let framesize = cli.framesize.unwrap_or(8192);
     let sockbuf = cli.sockbuf.unwrap_or(4 * 1024 * 1024);
     let keepalive = cli.keepalive.unwrap_or(10);
+    let keepalivetimeout = cli.keepalivetimeout.unwrap_or(30).max(0) as u64;
+    let ackstalltimeout = cli
+        .ackstalltimeout
+        .unwrap_or(kcptun_common::ACK_STALL_DEFAULT_SECS as i64)
+        .max(0) as u64;
     let autoexpire = cli.autoexpire.unwrap_or(0);
     let scavengettl = cli.scavengettl.unwrap_or(600);
     let closewait = cli.closewait.unwrap_or(0).max(0) as u64;
@@ -186,6 +191,8 @@ pub(crate) async fn async_main() -> Result<()> {
         streambuf,
         framesize,
         keepalive: keepalive.max(0) as u64,
+        keepalivetimeout,
+        ackstalltimeout,
         nocomp,
         ratelimit,
     };
@@ -193,6 +200,25 @@ pub(crate) async fn async_main() -> Result<()> {
     info!(
         "key derived: crypt={}, key={:02x}..{:02x}",
         crypt, key[0], key[31]
+    );
+    info!(
+        "session watchdog: ack-stall window={}s ({}), fast path needs peer-restart evidence",
+        session_cfg.ackstalltimeout,
+        if session_cfg.ackstalltimeout == 0 {
+            "disabled"
+        } else {
+            "closes after that much unacknowledged outbound data"
+        }
+    );
+    info!(
+        "smux keepalive: interval={}s timeout={}s ({})",
+        session_cfg.keepalive,
+        session_cfg.keepalivetimeout,
+        if session_cfg.keepalivetimeout == 0 {
+            "timeout check disabled"
+        } else {
+            "session closed after that much inbound silence"
+        }
     );
 
     // Validate the remote address once; each actual dial re-resolves DNS and
@@ -435,9 +461,14 @@ pub(crate) async fn async_main() -> Result<()> {
                     // (server still down, or the replacement died instantly).
                     let cooled_down = now_ms.saturating_sub(last_redial_ms[idx]) >= 1000;
                     if !dead && !expired && log::log_enabled!(log::Level::Debug) {
+                        // `write_blocked_ms` / `out_idle_ms` separate a local
+                        // writer stall from a silent peer: on the wire they
+                        // both look like the session simply stopped talking.
                         log::debug!(
-                            "conn {idx} alive: last_inbound_age_ms={}",
-                            guard[idx].inbound_idle_ms()
+                            "conn {idx} alive: inbound_age_ms={} out_idle_ms={} write_blocked_ms={}",
+                            guard[idx].inbound_idle_ms(),
+                            guard[idx].out_idle_ms(),
+                            guard[idx].write_blocked_ms()
                         );
                     }
                     (dead || expired) && cooled_down

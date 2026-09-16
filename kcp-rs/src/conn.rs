@@ -652,6 +652,46 @@ impl KcpStream {
         self.shared.remote_addr
     }
 
+    /// Datagrams dropped because they carried a different conversation ID.
+    ///
+    /// The listener uses this to tell "the peer re-dialed from this address"
+    /// (evict the stale session) from "the peer went quiet" (leave it alone).
+    pub fn conv_mismatch_count(&self) -> u64 {
+        self.shared.conv_mismatch.load(Ordering::Relaxed)
+    }
+
+    /// Next sequence number this connection expects from the peer (0 = nothing
+    /// received yet). Diagnostics for the re-dial detection above.
+    pub fn rcv_nxt(&self) -> u32 {
+        self.shared.kcp.lock().rcv_nxt()
+    }
+
+    /// Milliseconds since the last datagram received from the peer, of any kind.
+    ///
+    /// ACK-only packets count: a peer whose KCP still acknowledges our data is
+    /// alive even while it sends no SMUX frames of its own, so "nothing at all
+    /// arrived" — not "no frames arrived" — is the real peer-gone signal.
+    pub fn rx_age_ms(&self) -> u64 {
+        self.shared.rx_age_ms()
+    }
+
+    /// Next sequence number this connection will send. Diagnostics: a frozen
+    /// `snd_nxt` with `wait_send > 0` means the sender stopped producing.
+    pub fn snd_nxt(&self) -> u32 {
+        self.shared.kcp.lock().snd_nxt()
+    }
+
+    /// Segments numbered 0 seen on a session that already received data: the
+    /// peer re-dialed and reused this address, so this session is the stale one.
+    pub fn peer_restart_count(&self) -> u64 {
+        self.shared.peer_restart.load(Ordering::Relaxed)
+    }
+
+    /// The peer address this connection talks to.
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.shared.remote_addr
+    }
+
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.shared.transport.local_addr()
     }
@@ -1307,6 +1347,8 @@ impl KcpStreamBuilder {
             closed: Arc::new(AtomicBool::new(false)),
             cancel_token: CancellationToken::new(),
             adopt_conv: AtomicBool::new(self.adopt_conv),
+            conv_mismatch: AtomicU64::new(0),
+            peer_restart: AtomicU64::new(0),
             background_input: self.background_input,
             last_activity_ms: AtomicU64::new(knet::mono_ms()),
             last_rx_ms: AtomicU64::new(knet::mono_ms()),
