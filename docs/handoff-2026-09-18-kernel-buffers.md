@@ -253,3 +253,38 @@ server reports `1.00`. Parity *is* sent — the Rust client's own counters show
 counter-semantics deviation in a column that is supposed to be Go-compatible,
 not a behaviour difference. Fix: increment where the datagram is written
 (`flush_tx_batch`/`send_packets`), not in the KCP callback.
+
+---
+
+## 9. Mode A/B: fast3 wastes bandwidth, fast2 is the pick
+
+The live server log showed the waste directly — in the last two production
+windows before the change, `RetransSegs/OutSegs` was **66 %** with
+`LostSegs ≈ RetransSegs` and `FastRetransSegs = 8`, i.e. RTO-driven
+retransmission, not fast retransmit.
+
+Three arms, same flags (`--mtu 1200 --sndwnd 512 --rcvwnd 512/1024 -ds 10 -ps 3
+--nocomp --sockbuf 4194304 --smuxbuf 4194304`, no `--acknodelay`), 20 MB per
+download, 3 interleaved rounds with rotated order, server SNMP deltas per
+download:
+
+| mode | goodput median | retransmits | wire packets / MB payload |
+|---|---|---|---|
+| fast3 (nodelay 1, interval 10) | 1.35 MB/s | **20.0 %** | **1499** |
+| **fast2 (nodelay 1, interval 20)** | **1.56 MB/s** | **12.0 %** | **1364** |
+| fast (nodelay 0, interval 30) | 1.55 MB/s | 12.4 % | 1371 |
+
+fast3 costs ~10 % more wire packets for the same delivered payload **and** is
+13 % slower: the extra retransmits eat the policed path instead of buying
+recovery. The mechanism is the backoff: with `nodelay = 1` KCP grows a
+segment's RTO by half the current estimate (`seg.rto += rx_rto / 2`), with
+`nodelay = 0` by the whole one — so on a path that really loses packets, fast3
+re-sends each lost segment roughly twice as often.
+
+fast2 and fast tie on goodput and efficiency; fast2 wins on interactivity
+(`nodelay = 1` flushes immediately and floors the RTO at 30 ms instead of 100).
+**Production switched to `--mode fast2` on both ends** the same day.
+
+This also retracts the earlier advice in §6 ("`--mode fast3` — measured +20–25 %
+over `fast`"): that measurement predates FEC 10/3, the socket-buffer fix and the
+acknodelay removal, and it did not look at retransmits at all.
