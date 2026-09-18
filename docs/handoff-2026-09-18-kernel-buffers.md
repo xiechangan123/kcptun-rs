@@ -108,3 +108,148 @@ lines, 3 new sessions, and the client re-dialed on its own after the restart.
    `--mode fast3` (measured +20–25% over `fast` on this path),
    `--rcvwnd 512` (uplink headroom — now safe, 737 KB ≪ 4 MB queue), and
    `--conn 2..4` on the client (per-flow shaping across the 11 listen ports).
+
+---
+
+## 6. FEC A/B — the path is loss-recovery-limited, not byte-quota-limited
+
+Setup: a second kcptun pair on spare ports (50300-50303) with a plain HTTP target
+on the VPS (`python3 -m http.server 18080` serving a 20 MB `/tmp/abtest.bin`), so
+the measurement contains no internet path and no ss-server. Client flags mirrored
+production (`--mode fast3 --sndwnd 512 --rcvwnd 1024 --mtu 1200 --acknodelay
+--sockbuf 4194304 --smuxbuf 4194304`), servers differed **only** in FEC. Three
+interleaved rounds of 20 MB per arm, order rotated, medians:
+
+| FEC | samples (MB/s) | median |
+|---|---|---|
+| off (0/0) | 0.83 / 0.77 / 0.75 | 0.77 |
+| 10/2 | 1.31 / 1.12 / 1.17 | 1.17 |
+| **10/3** | 1.25 / 1.25 / 1.26 | **1.25** |
+| 10/4 | 1.01 / 1.08 / 1.02 | 1.02 |
+
+**Reading:** dropping FEC costs ~35 % of goodput, and one extra parity shard
+beats both the 20 % and the 40 % variant. The earlier inference that "FEC's 20 %
+overhead is 20 % of a byte-quota path" is therefore **wrong for this path**: the
+ceiling is set by loss-recovery stalls (each unrecovered loss costs an RTO of
+~200–400 ms on a 190 ms RTT), not by bytes. Paying overhead to avoid stalls wins
+until parity stops buying recovery (10/4).
+
+Applied to production the same day: both ends `--datashard 10 --parityshard 3`
+(the Go default), verified by the parity/data ratio in the SNMP counters on both
+directions (server uplink 0.30, client downlink 0.27–0.28) plus a working
+handshake; 0 session reconnects in the 4+ minutes after the restart.
+
+Two corrections to advice given earlier in the same session:
+
+- **Keep `--acknodelay`.** ACKs are flushed once per RX batch (≤ 32 datagrams,
+  `RECV_BATCH` / `READ_PREFETCH_MAX_MESSAGES`), not per segment, so it does not
+  inflate packet count — and it removes the interval-long ACK delay.
+- **Do not turn FEC off.** Measured above.
+
+Still on the table, now with numbers: the **client's uplink retransmit rate is
+~23 %** (`RetransSegs/OutSegs` in the client's own SNMP log) while the server's
+downlink retransmits ~5–7 %. The uplink itself is clean (`FECRecovered` ≈ 0), so
+those are spurious RTOs triggered by ACK loss on the throttled downlink — the
+next thing worth attacking (levers: `--resend`, the nodelay/interval pair, or
+making the server's ACKs more robust). `--snmplog` is now enabled on the
+production client (`/tmp/client_snmp.log`) so this is measurable.
+
+Harness leftovers for the next round: `/tmp/abtest.bin` on the VPS and
+`/tmp/ab3.sh` on the Mac (the arm clients/servers themselves were stopped).
+
+
+---
+
+## 7. Rust vs Go under the optimal parameters (same day, same path)
+
+Go binaries: `tests/kcptun-go/{client,server}` are macOS arm64, so the **server**
+came from the Linux VM (`192.168.0.84:/root/kcpbench/go-server`, static x86-64,
+copied to the VPS as `/tmp/go-server`); the client is the repo's macOS build.
+Both arms ran the same flags — `--mode fast3 --mtu 1200 --sndwnd 512 --rcvwnd
+512` (server) / `1024` (client), `-ds 10 -ps 3`, `--smuxbuf 4194304
+--sockbuf 4194304 --acknodelay`, and (in the final run) `--nocomp` — against the
+same VPS-local HTTP target, 20 MB per download, interleaved with rotated order.
+
+| arm | samples (MB/s) | median |
+|---|---|---|
+| **Rust (optimal)** | 1.31 / 1.37 / 1.24 / 1.31 | **1.31** |
+| **Go (same flags)** | 0.91 / 0.81 / 0.74 / 0.72 | **0.78** |
+
+**Rust is ~68 % faster** end to end on this path under this parameter set.
+
+Crossover run (4 combos, 3 rounds, compression on) to attribute it:
+
+| client → server | median |
+|---|---|
+| Rust → Rust | 1.13 |
+| Go → Rust | 1.02 |
+| Rust → Go | 0.84 |
+| Go → Go | 0.76 |
+
+So the **server implementation carries most of the gap (~+35 %)**, the client
+~+10 %. Two candidate explanations were eliminated: the socket buffer is not it
+(a Rust arm pinned to Go's clamped 266 KB matched the 8 MB arm, 1.13 vs 1.14),
+and neither side is CPU-bound (Rust 1.35 s and Go 2.00 s of CPU per 20 MB, each
+~8 % of the one core; the VPS is a Xeon E5-2620 v2 *with* AES-NI, so crypto is
+not the differentiator). Go does burn ~48 % more CPU per MB, which is worth
+knowing but does not by itself explain the throughput gap. Root cause is still
+open — the next step is per-arm SNMP (`RetransSegs`/`LostSegs`/`FECRecovered`)
+to see whether Go retransmits more or recovers less.
+
+This contradicts the earlier handoff note ("Go ~10 % faster on this lossy
+path"): that was measured under a different parameter set (`--mode fast`,
+`sndwnd/rcvwnd 1024`, `--nocomp`). The ranking is parameter-dependent; under the
+current optimal set Rust wins decisively.
+
+**`--nocomp` is worth +16 %** on incompressible data (1.24 vs 1.07 MB/s, same
+Rust stack, 3 interleaved rounds). It is not applied to production yet: real
+browsing mixes compressible HTML/JS with incompressible video, and the test file
+was random, so this needs a look at real traffic before switching. Remember it
+must be set on **both** ends.
+
+Harness leftovers: `/tmp/go-server` on the VPS (13 MB, static), `/tmp/abtest.bin`
+(20 MB) on the VPS, `/tmp/ab*.sh` on the Mac.
+
+---
+
+## 8. Root cause of the Rust-vs-Go gap: `--acknodelay`
+
+The 68 % gap in §7 was an artefact. Isolating one flag at a time (same path,
+20 MB per download, interleaved, `--nocomp` everywhere):
+
+| stack | `--acknodelay` | samples (MB/s) | median |
+|---|---|---|---|
+| Rust | on | 1.54 / 1.36 / 1.44 / 1.37 | 1.41 |
+| Rust | **off** | 1.71 / 1.63 / 1.65 / 1.62 | **1.64** |
+| Go | on | 0.77 / 0.79 / 0.73 | 0.77 |
+| Go | **off** | 1.28 / 1.75 / 1.47 | **1.47** |
+
+Head-to-head with both stacks on the best settings: **Rust 1.70 vs Go 1.46 MB/s
+(medians of 4 rounds) → Rust ~16 % faster**, not 68 %.
+
+**Mechanism.** `--acknodelay` makes the receiver ACK every segment instead of
+batching. Go takes that literally — the Go server received 980 inbound
+segments/s while sending 1068/s (≈ 1 ACK packet per data segment, 3× the Rust
+client's rate, which still coalesces per RX batch). The extra uplink packets
+cost uplink loss, so the sender's RTO fires for data whose ACK was lost:
+Go declared **36.6 % of its outbound segments lost** (Rust 22.4 %), retransmitted
+**42.9 %** of everything it sent (Rust 22.6 %), and burned the downlink on
+retransmits. Rust's acknodelay path is far less harmful (+16 % vs Go's +91 %),
+which is why the gap looked like an implementation difference.
+
+Applied to production: the client's `--acknodelay` is **removed** (server never
+had it). This also retracts the earlier advice in §6 to keep it — the code
+reading said ACKs batch per RX batch, the measurement says the resulting uplink
+load still costs far more than the ≤ interval ACK delay it saves.
+
+### Bug found while measuring: `OutPkts` counts the wrong thing
+
+The Rust port increments `DEFAULT_SNMP.out_pkts` in the KCP output callback
+(`kcp-rs/src/conn.rs:1299`), i.e. **once per KCP segment, before FEC expansion**.
+Go counts datagrams actually handed to the socket. With FEC 10/3 the difference
+is visible in the CSV: Go's server reports `OutPkts/OutSegs = 1.29`, the Rust
+server reports `1.00`. Parity *is* sent — the Rust client's own counters show
+`InPkts/InSegs = 1.23` and `FECParityShards/InSegs = 0.28` — so this is a
+counter-semantics deviation in a column that is supposed to be Go-compatible,
+not a behaviour difference. Fix: increment where the datagram is written
+(`flush_tx_batch`/`send_packets`), not in the KCP callback.
