@@ -9,11 +9,15 @@ use log::warn;
 ///
 /// Sharded server startup moves this raw fd into its dedicated local runtime
 /// before calling `knet::UdpSocket::from_std`, preserving poller ownership.
+///
+/// Returns the buffers the kernel actually holds: `--sockbuf` is capped by
+/// `net.core.{r,w}mem_max` (usually host-owned inside a container), and the
+/// caller reports the granted value instead of the requested one.
 pub(crate) fn create_udp_socket_std(
     addr: SocketAddr,
     sockbuf: u32,
     dscp: u32,
-) -> Result<std::net::UdpSocket> {
+) -> Result<(std::net::UdpSocket, knet::SocketBuffers)> {
     build_udp(addr, sockbuf, dscp, false)
 }
 
@@ -22,7 +26,7 @@ pub(crate) fn create_udp_socket_shard_std(
     addr: SocketAddr,
     sockbuf: u32,
     dscp: u32,
-) -> Result<std::net::UdpSocket> {
+) -> Result<(std::net::UdpSocket, knet::SocketBuffers)> {
     build_udp(addr, sockbuf, dscp, true)
 }
 
@@ -31,7 +35,7 @@ fn build_udp(
     sockbuf: u32,
     dscp: u32,
     reuse_port: bool,
-) -> Result<std::net::UdpSocket> {
+) -> Result<(std::net::UdpSocket, knet::SocketBuffers)> {
     let socket = socket2::Socket::new(
         if addr.is_ipv4() {
             socket2::Domain::IPV4
@@ -41,11 +45,9 @@ fn build_udp(
         socket2::Type::DGRAM,
         None,
     )?;
-    if let Err(e) = socket.set_recv_buffer_size(sockbuf as usize) {
-        warn!("set_recv_buffer_size failed: {}", e);
-    }
-    if let Err(e) = socket.set_send_buffer_size(sockbuf as usize) {
-        warn!("set_send_buffer_size failed: {}", e);
+    let buffers = knet::set_socket_buffers(&socket, sockbuf as usize);
+    if !buffers.granted() {
+        warn!("sockbuf {}", knet::net::sockbuf::describe(&buffers));
     }
     if reuse_port {
         // SO_REUSEPORT: allow N sockets to bind the same addr:port; the kernel
@@ -66,5 +68,5 @@ fn build_udp(
     }
     socket.bind(&addr.into())?;
     socket.set_nonblocking(true)?;
-    Ok(socket.into())
+    Ok((socket.into(), buffers))
 }

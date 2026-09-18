@@ -55,8 +55,10 @@ pub(crate) fn create_client_udp_socket(
     };
     let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
     let buf_size = sockbuf as usize;
-    let _ = socket.set_recv_buffer_size(buf_size);
-    let _ = socket.set_send_buffer_size(buf_size);
+    let buffers = knet::set_socket_buffers(&socket, buf_size);
+    if !buffers.granted() {
+        log::warn!("sockbuf {}", knet::net::sockbuf::describe(&buffers));
+    }
     let _ = socket.set_reuse_address(true);
     if dscp > 0 {
         // Go: IPv4 → IP_TOS = dscp << 2; IPv6 → IPV6_TCLASS = dscp (no shift).

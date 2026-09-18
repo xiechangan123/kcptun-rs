@@ -17,7 +17,7 @@ UDP/raw TCP → BlockCrypt/AEAD (+ optional QPP) → (+ optional FEC) → KCP AR
 | Crate | Purpose | Notes |
 |-------|---------|-------|
 | `qpp-rs` | Quantum Permutation Pad stream obfuscation | no internal deps |
-| `knet-rs` (lib `knet`) | tokio I/O facade: `TcpStream`, `UdpSocket`, `DatagramSocket` (Linux mmsg), tcpraw (raw IP), `spawn_task`, `cpu_block`, `sleep_ms`, `block_on` | mmsg/tcpraw compile on Linux only (macOS stubs). `raw_udp` has a Windows fallback using `std::net::UdpSocket`. |
+| `knet-rs` (lib `knet`) | tokio I/O facade: `TcpStream`, `UdpSocket`, `DatagramSocket` (Linux mmsg), tcpraw (raw IP), `set_socket_buffers` (SO_*BUFFFORCE escalation), `spawn_task`, `cpu_block`, `sleep_ms`, `block_on` | mmsg/tcpraw compile on Linux only (macOS stubs). `raw_udp` has a Windows fallback using `std::net::UdpSocket`. `net::sockbuf` retries a clamped `SO_*BUF` with `SO_*BUFFFORCE` (needs CAP_NET_ADMIN) and reports what the kernel granted — containers lock `net.core.{r,w}mem_max` far below the KCP window. |
 | `kpprof-rs` | Go-compatible pprof HTTP server + `ProfilingAllocator` | default binary feature `pprof`. **pprof-rs (CPU/heap profiling) is gated to `cfg(unix)`** — on Windows, the HTTP server runs but CPU profile returns 501 and heap/allocs return empty. `ProfilingAllocator` works cross-platform (raw address capture); only symbolization + Go pprof protobuf encoding are Unix-only. |
 | `kcrypt-rs` | 13 BlockCrypt + AES-128-GCM + wire packing (`CryptoBuf`/`encrypt_batch`) | no crypto lives in kcp-rs. AES-CFB picks its backend at construction: hardware AES (AES-NI/ARMv8) → `aes` crate; otherwise Go-style T-table soft AES (`crypt/aes_soft.rs`) — CFB can't amortize fixslice batching (3.6× slower per block). Soft tables are NOT constant-time, same posture as Go's `crypto/aes` fallback. |
 | `kcp-rs` | KCP ARQ state machine, FEC, SNMP; feature `async` adds `KcpStream`/`KcpListener`/`PacketTransport` | deps: knet-rs (optional) |
@@ -140,6 +140,7 @@ the retirement path aborts in-flight downloads whenever a slot is replaced.
 
 - Global allocator: `mimalloc` in both binaries.
 - Crypto selection: `kcrypt_rs::select_block_crypt` / `select_aead_crypt`; packet packing via `kcrypt_rs::wire::CryptoBuf` + `encrypt_batch`.
+- Socket buffers: go through `knet::set_socket_buffers` (not raw `set_recv_buffer_size`) so a container-clamped `net.core.{r,w}mem_max` is escalated with `SO_*BUFFFORCE`, and size the logical windows to fit the granted value: a KCP send window is `sndwnd × mtu × (ds+ps)/ds` bytes, and `--smuxbuf` should stay ≤ the granted socket buffer.
 - SNMP logging: `kcptun_common::snmp_log::snmp_logger` writes the Go CSV plus a Rust-only sidecar `<path>.rustobs` (`timestamp,WriteInlineSends,WriteFlushSends`).
 
 ## Dependencies

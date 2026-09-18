@@ -283,7 +283,7 @@ pub(crate) async fn async_main() -> Result<()> {
     if dscp > 0 {
         info!("dscp: {}", dscp);
     }
-    info!("sockbuf: {}", sockbuf);
+    info!("sockbuf: requested={}", sockbuf);
 
     // Start SNMP logger if configured
     let stop_flag = Arc::new(AtomicBool::new(false));

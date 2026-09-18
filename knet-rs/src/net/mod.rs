@@ -107,6 +107,8 @@ mod mmsg;
 
 mod tokio;
 
+pub mod sockbuf;
+
 #[cfg(unix)]
 pub use self::tokio::UnixListener;
 pub use self::tokio::{TcpListener, TcpStream, UdpSocket};

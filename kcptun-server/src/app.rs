@@ -262,7 +262,7 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
             if ratelimit_val > 0 {
                 info!("ratelimit: {} bytes/sec", ratelimit_val);
             }
-            info!("sockbuf: {}", sockbuf);
+            info!("sockbuf: requested={}", sockbuf);
         }
     }
 
@@ -286,13 +286,15 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
         cli.shards as usize
     };
     let mut udp_sockets: Vec<std::net::UdpSocket> = Vec::with_capacity(listen_addrs.len() * shards);
+    let mut granted_buffers: Option<knet::SocketBuffers> = None;
     for addr in &listen_addrs {
         for s in 0..shards {
-            let socket = if shards > 1 {
+            let (socket, buffers) = if shards > 1 {
                 socket::create_udp_socket_shard_std(*addr, sockbuf, dscp_val)?
             } else {
                 socket::create_udp_socket_std(*addr, sockbuf, dscp_val)?
             };
+            granted_buffers.get_or_insert(buffers);
             if shards > 1 {
                 info!(
                     "listening on {} for KCP connections (shard {}/{})",
@@ -313,7 +315,10 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
     if dscp_val > 0 {
         info!("dscp: {}", dscp_val);
     }
-    info!("sockbuf: {}", sockbuf);
+    match granted_buffers {
+        Some(ref b) => info!("sockbuf: {}", knet::net::sockbuf::describe(b)),
+        None => info!("sockbuf: requested={}", sockbuf),
+    }
 
     // Start SNMP logger if configured
     if let Some(ref snmplog_path) = cli.snmplog {
