@@ -319,6 +319,10 @@ impl SharedIoState {
             None
         };
         let wire = fec_wire.as_deref().unwrap_or(&packets);
+        // `OutPkts` counts datagrams handed to the socket (Go semantics), so it
+        // is counted here and in `flush_tx_batch` — on the post-FEC wire batch,
+        // not in the KCP output callback, which fires per segment.
+        crate::snmp::add(&crate::snmp::DEFAULT_SNMP.out_pkts, wire.len() as u64);
         // Non-blocking send. A partial send (including Ok(0)) or WouldBlock is
         // completed by an async continuation that retains the send token.
         let result = if self.connected {
@@ -455,8 +459,14 @@ impl SharedIoState {
         // FEC-expand if configured (sync).
         let wire: Vec<Bytes> = if let Some(ref enc) = self.fec_encoder {
             let mut e = enc.lock();
-            fec_expand_packets(&mut e, packets, 500)
+            let wire = fec_expand_packets(&mut e, packets, 500);
+            // `OutPkts` counts datagrams handed to the socket, matching Go —
+            // so it is counted here, on the post-FEC wire batch, and not in the
+            // KCP output callback (which fires per segment, before expansion).
+            crate::snmp::add(&crate::snmp::DEFAULT_SNMP.out_pkts, wire.len() as u64);
+            wire
         } else {
+            crate::snmp::add(&crate::snmp::DEFAULT_SNMP.out_pkts, packets.len() as u64);
             // Non-FEC fast path: try_send_batch with the original slice,
             // no clone needed. `try_send_batch` returns Ok(0) on
             // WouldBlock (non-Linux) — treat that as a fallthrough to the

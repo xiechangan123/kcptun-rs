@@ -1296,7 +1296,10 @@ impl KcpStreamBuilder {
         let raw_packets_cb = raw_packets.clone();
 
         let mut kcp = KCP::new(config.conv, config.token, move |data: Bytes| {
-            crate::snmp::add(&crate::snmp::DEFAULT_SNMP.out_pkts, 1);
+            // `OutPkts` is counted on the wire batch in `flush_tx_batch`, not
+            // here: this callback fires once per KCP segment, before FEC
+            // expansion, so counting here reports segments and undercounts the
+            // parity datagrams that actually go out.
             raw_packets_cb.lock().push(data);
         });
         kcp.apply(&config);
@@ -1681,6 +1684,53 @@ mod integ {
 
         assert_eq!(*transport.sent.lock(), packets);
         assert_eq!(transport.async_calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// `OutPkts` counts datagrams handed to the socket, so an FEC batch reports
+    /// the post-expansion wire count. Counting it in the KCP output callback
+    /// (where it used to live) reports segments instead and drops the parity
+    /// datagrams entirely.
+    #[tokio::test]
+    async fn out_pkts_counts_wire_datagrams_not_segments() {
+        let transport = Arc::new(PartialBatchTransport::with_try_limit(usize::MAX));
+        let conn = KcpStream::with_transport(
+            transport.clone() as Arc<dyn PacketTransport>,
+            SocketAddr::from(([127, 0, 0, 1], 9)),
+        )
+        .connected(true)
+        .background_input(false)
+        .spawn_flush_loop(false)
+        .fec(10, 3)
+        .build()
+        .await
+        .unwrap();
+
+        let batch: Vec<Bytes> = (0..10).map(|i| Bytes::from(vec![i as u8; 32])).collect();
+        crate::snmp::enable();
+        let before = crate::snmp::DEFAULT_SNMP.out_pkts.load(Ordering::SeqCst);
+
+        // The first group may or may not carry parity: the encoder skips it
+        // when the previous packet is older than its RTO window, which depends
+        // on process uptime.
+        conn.shared.flush_tx_batch(&batch).await.unwrap();
+        let after_first = transport.sent.lock().len();
+
+        // Second group is continuous by construction: 10 data + 3 parity.
+        conn.shared.flush_tx_batch(&batch).await.unwrap();
+        let after_second = transport.sent.lock().len();
+        assert_eq!(after_second - after_first, 13, "10 data shards + 3 parity");
+
+        let after = crate::snmp::DEFAULT_SNMP.out_pkts.load(Ordering::SeqCst);
+        // Lower bound rather than equality: DEFAULT_SNMP is process-global and
+        // other tests in this binary increment it concurrently. Before the fix
+        // this batch moved it by 0 (the callback it was counted in is not on
+        // this path), so anything below the wire count is a regression.
+        assert!(
+            after - before >= after_second as u64,
+            "out_pkts moved by {} for {} datagrams on the wire",
+            after - before,
+            after_second
+        );
     }
 
     /// A refused datagram before/while the peer is silent means the peer is
