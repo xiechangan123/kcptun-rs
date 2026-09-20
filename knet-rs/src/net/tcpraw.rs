@@ -659,6 +659,12 @@ impl Drop for TcpRawConn {
 /// Server-side TCP raw listener.
 pub struct TcpRawListener {
     real: std::net::TcpListener,
+    /// Accepted connections handed over by the dedicated accept thread.
+    /// A blocking `accept()` must never run on the shared `cpu_block` pool:
+    /// the pool is sized to CPU count and meant for CPU work, so pending
+    /// accepts starved Snappy/crypto offload and muted whole sessions (see
+    /// bugs/BUGREPORT_tcpraw_accept_starves_cpu_pool.md).
+    conn_rx: async_channel::Receiver<io::Result<(std::net::TcpStream, SocketAddr)>>,
     raw_fd: Arc<OwnedFd>,
     channels: Arc<
         std::sync::Mutex<std::collections::HashMap<SocketAddr, async_channel::Sender<Vec<u8>>>>,
@@ -674,9 +680,6 @@ pub struct TcpRawListener {
 impl TcpRawListener {
     pub fn bind(addr: &SocketAddr) -> io::Result<Self> {
         let real = std::net::TcpListener::bind(*addr)?;
-        // Keep the listener **blocking**. `accept()` runs inside `cpu_block`.
-        real.set_nonblocking(false)?;
-
         let raw_fd = Arc::new(open_raw_tcp_socket()?);
         let local_port = real.local_addr()?.port();
 
@@ -684,20 +687,62 @@ impl TcpRawListener {
         let flows = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
         let (close_tx, close_rx) = async_channel::bounded::<()>(1);
+        let (conn_tx, conn_rx) =
+            async_channel::bounded::<io::Result<(std::net::TcpStream, SocketAddr)>>(16);
 
         {
             let raw_fd = raw_fd.clone();
             let channels = channels.clone();
             let flows = flows.clone();
+            let capture_close_rx = close_rx.clone();
             thread::Builder::new()
                 .name("tcpraw-srv-capture".into())
                 .spawn(move || {
-                    server_capture_thread(raw_fd, channels, flows, local_port, close_rx);
+                    server_capture_thread(raw_fd, channels, flows, local_port, capture_close_rx);
+                })?;
+        }
+
+        // One accept thread per listener. It owns its fd clone and polls with
+        // a short sleep so it stays interruptible (a close signal or drop of
+        // the listener ends it) and — critically — so the blocking wait never
+        // occupies a `cpu_block` pool worker, which starved session write
+        // loops until they went mute.
+        {
+            let listener = real.try_clone()?;
+            let close_rx = close_rx.clone();
+            thread::Builder::new()
+                .name("tcpraw-srv-accept".into())
+                .spawn(move || {
+                    let _ = listener.set_nonblocking(true);
+                    loop {
+                        match listener.accept() {
+                            Ok((stream, peer)) => {
+                                if conn_tx.send_blocking(Ok((stream, peer))).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock
+                                || e.kind() == io::ErrorKind::Interrupted =>
+                            {
+                                match close_rx.try_recv() {
+                                    Err(async_channel::TryRecvError::Empty) => {
+                                        thread::sleep(std::time::Duration::from_millis(100));
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            Err(e) => {
+                                let _ = conn_tx.try_send(Err(e));
+                                break;
+                            }
+                        }
+                    }
                 })?;
         }
 
         Ok(Self {
             real,
+            conn_rx,
             raw_fd,
             channels,
             flows,
@@ -717,8 +762,13 @@ impl TcpRawListener {
     }
 
     pub async fn accept(&self) -> io::Result<(TcpRawConn, SocketAddr)> {
-        let listener = self.real.try_clone()?;
-        let (stream, peer_addr) = crate::task::cpu_block(move || listener.accept()).await?;
+        // The blocking wait lives on the dedicated accept thread (see `bind`);
+        // this await only receives an already-accepted connection.
+        let (stream, peer_addr) = self
+            .conn_rx
+            .recv()
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::NotConnected, "tcpraw listener closed"))??;
         let _ = stream.set_nonblocking(true);
 
         let local = stream.local_addr()?;
@@ -1517,6 +1567,44 @@ mod integration_tests {
             assert!(rule_exists(&rule));
             c.close();
             assert!(!rule_exists(&rule));
+        });
+    }
+
+    /// Regression: pending accepts must never occupy the shared `cpu_block`
+    /// pool. Accepts used to run a blocking `listener.accept()` on that pool;
+    /// once every worker sat in a pending accept (one public listener each on
+    /// a server listening on a port range), Snappy/crypto offload jobs queued
+    /// forever and session write loops parked mid-batch — no data, no
+    /// keepalive NOPs, until the peer's silence watchdog killed the session.
+    /// With the dedicated accept thread, `cpu_block` must complete while many
+    /// accepts are pending.
+    #[test]
+    fn pending_accepts_do_not_starve_the_cpu_block_pool() {
+        if !root_test() {
+            skip();
+            return;
+        }
+        crate::block_on(async {
+            let server = Arc::new(TcpRawListener::bind(&SocketAddr::from(([127, 0, 0, 1], 0))).unwrap());
+            // Occupy the whole blocking pool (one job per worker) with parked
+            // accepts; spawn one extra for slack. Each spawned task polls its
+            // future, which is what used to submit the blocking accept job.
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .clamp(2, 8);
+            for _ in 0..workers + 2 {
+                let server = server.clone();
+                crate::spawn_task(async move {
+                    let _ = server.accept().await;
+                });
+            }
+            // With the old cpu_block accept this only ran once an accept
+            // returned (never, with no incoming connection).
+            let done = crate::timeout(Duration::from_secs(2), crate::cpu_block(|| 40u32 + 2))
+                .await
+                .expect("cpu_block must not starve behind pending accepts");
+            assert_eq!(done, 42);
         });
     }
 }

@@ -872,6 +872,48 @@ async fn watchdog_loop(
     }
 }
 
+/// How long the session write loop waits for the shared blocking pool before
+/// compressing inline instead.
+///
+/// The pool is shared by every CPU offload (Snappy here, crypto in
+/// `KcpTransport`), so when all its workers are occupied — or, before the
+/// tcpraw-accept fix, stuck on pending accepts — an unbounded wait parked the
+/// whole session write loop: no data, no keepalive NOPs, until the peer's
+/// silence watchdog killed the session. 200 ms sits orders of magnitude above
+/// a normal ≤64 KiB Snappy frame encode (sub-millisecond), while still
+/// bounding the damage of a starved pool to a slow batch instead of a mute.
+const COMPRESS_CPU_BLOCK_WAIT: Duration = Duration::from_millis(200);
+
+/// One Snappy frame-encode into the session encoder. Returns an empty buffer
+/// on encoder failure (the batch is dropped, matching the pre-offload inline
+/// behavior).
+fn snappy_encode_frame(
+    compressor: &Mutex<snap::write::FrameEncoder<Vec<u8>>>,
+    plain: Bytes,
+) -> Bytes {
+    let mut encoder = compressor.lock();
+    if encoder.write_all(&plain).is_err() || encoder.flush().is_err() {
+        return Bytes::new();
+    }
+    std::mem::take::<Vec<u8>>(encoder.get_mut()).into()
+}
+
+/// Warn at most once per 30 s when compress offload overflows to inline.
+fn warn_compress_offload_overflow() {
+    static LAST_WARN_MS: AtomicU64 = AtomicU64::new(0);
+    let now = knet::mono_ms();
+    let last = LAST_WARN_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= 30_000
+        && LAST_WARN_MS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        log::warn!(
+            "session write loop: Snappy offload exceeded {COMPRESS_CPU_BLOCK_WAIT:?}, compressing inline (blocking pool starved?)"
+        );
+    }
+}
+
 async fn write_loop(
     kcp: Arc<kcp_rs::KcpStream>,
     smux: Arc<smux_rs::Session>,
@@ -954,20 +996,27 @@ async fn write_loop(
         } else if let Some(compressor) = compressor.as_ref() {
             let plain = out.split().freeze();
             let plain_len = plain.len();
-            let encode = {
-                let compressor = compressor.clone();
-                move || {
-                    let mut encoder = compressor.lock();
-                    if encoder.write_all(&plain).is_err() || encoder.flush().is_err() {
-                        return Bytes::new();
-                    }
-                    std::mem::take::<Vec<u8>>(encoder.get_mut()).into()
-                }
-            };
             Some(if kcrypt_rs::should_cpu_block_compress(plain_len) {
-                knet::cpu_block(encode).await
+                // Offload with a bounded wait. The job gets a refcounted clone
+                // of `plain`; on timeout the original is still owned here, so
+                // the fallback compresses inline with zero data loss (the
+                // queued job's later result is simply dropped).
+                let job_compressor = compressor.clone();
+                let job_plain = plain.clone();
+                match knet::timeout(
+                    COMPRESS_CPU_BLOCK_WAIT,
+                    knet::cpu_block(move || snappy_encode_frame(&job_compressor, job_plain)),
+                )
+                .await
+                {
+                    Ok(encoded) => encoded,
+                    Err(_) => {
+                        warn_compress_offload_overflow();
+                        snappy_encode_frame(compressor, plain)
+                    }
+                }
             } else {
-                encode()
+                snappy_encode_frame(compressor, plain)
             })
         } else {
             Some(out.split().freeze())
