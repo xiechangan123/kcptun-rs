@@ -1733,6 +1733,138 @@ mod integ {
         );
     }
 
+    /// A send future dropped mid-flight — a stream closing while it was parked
+    /// in `flush_tx_batch` — must not keep the send token. Every sender checks
+    /// that token, so a leaked one leaves the session permanently mute: no
+    /// ACKs, no retransmits, no keepalives, until the peer's own timers tear
+    /// the session down. Seen live as `out_age_ms == write_blocked_ms` growing
+    /// past 131 s with the peer window open and an empty kernel send queue.
+    #[tokio::test]
+    async fn cancelled_send_releases_the_token() {
+        struct ParkedBatchTransport;
+
+        #[async_trait::async_trait]
+        impl PacketTransport for ParkedBatchTransport {
+            async fn recv(&self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+            fn try_recv(&self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+            /// Parks forever: the async send path never completes.
+            async fn send_batch(&self, _packets: &[Bytes]) -> io::Result<()> {
+                std::future::pending::<io::Result<()>>().await
+            }
+            async fn send_batch_to(&self, _packets: &[Bytes], _t: SocketAddr) -> io::Result<()> {
+                std::future::pending::<io::Result<()>>().await
+            }
+            /// WouldBlock so the caller takes the parking async path above.
+            fn try_send_batch(&self, _packets: &[Bytes]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+            fn try_send_batch_to(&self, _packets: &[Bytes], _t: SocketAddr) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+            fn local_addr(&self) -> io::Result<SocketAddr> {
+                Ok(SocketAddr::from(([127, 0, 0, 1], 0)))
+            }
+        }
+
+        let conn = KcpStream::with_transport(
+            Arc::new(ParkedBatchTransport) as Arc<dyn PacketTransport>,
+            SocketAddr::from(([127, 0, 0, 1], 9)),
+        )
+        .connected(true)
+        .background_input(false)
+        .spawn_flush_loop(false)
+        .build()
+        .await
+        .unwrap();
+
+        // A packet must be pending, or the send path returns before the await.
+        conn.shared
+            .raw_packets
+            .lock()
+            .push(Bytes::from_static(b"parked"));
+
+        // Drive the send, then cancel it the way a closing stream does.
+        let _ = knet::timeout(Duration::from_millis(50), conn.shared.try_drain_and_send()).await;
+
+        assert!(
+            !conn.shared.is_sending.load(Ordering::Acquire),
+            "send token leaked when the send future was dropped mid-flight"
+        );
+    }
+
+    /// `try_drain_and_send` must bound the async flush. A transport whose
+    /// `send_batch` parks forever (downlink congestion that never drains)
+    /// used to hold `is_sending` for the life of the session and mute TX:
+    /// no ACKs, no retransmits. The bounded path returns, releases the token,
+    /// and — without FEC — requeues the pre-FEC batch for the next drain.
+    #[tokio::test]
+    async fn flush_tx_timeout_releases_token_and_requeues() {
+        struct ParkedBatchTransport;
+
+        #[async_trait::async_trait]
+        impl PacketTransport for ParkedBatchTransport {
+            async fn recv(&self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+            fn try_recv(&self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+            async fn send_batch(&self, _packets: &[Bytes]) -> io::Result<()> {
+                std::future::pending::<io::Result<()>>().await
+            }
+            async fn send_batch_to(&self, _packets: &[Bytes], _t: SocketAddr) -> io::Result<()> {
+                std::future::pending::<io::Result<()>>().await
+            }
+            fn try_send_batch(&self, _packets: &[Bytes]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+            fn try_send_batch_to(&self, _packets: &[Bytes], _t: SocketAddr) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+            fn local_addr(&self) -> io::Result<SocketAddr> {
+                Ok(SocketAddr::from(([127, 0, 0, 1], 0)))
+            }
+        }
+
+        let conn = KcpStream::with_transport(
+            Arc::new(ParkedBatchTransport) as Arc<dyn PacketTransport>,
+            SocketAddr::from(([127, 0, 0, 1], 9)),
+        )
+        .connected(true)
+        .background_input(false)
+        .spawn_flush_loop(false)
+        .build()
+        .await
+        .unwrap();
+
+        conn.shared
+            .raw_packets
+            .lock()
+            .push(Bytes::from_static(b"parked"));
+
+        // No external cancellation: the internal TX_FLUSH_TIMEOUT must fire.
+        let started = std::time::Instant::now();
+        let acquired = conn.shared.try_drain_and_send().await;
+        assert!(acquired, "try_drain_and_send should have taken the token");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "bounded flush took {:?}; token would mute the session",
+            started.elapsed()
+        );
+        assert!(
+            !conn.shared.is_sending.load(Ordering::Acquire),
+            "send token still held after bounded flush timeout"
+        );
+        assert!(
+            !conn.shared.raw_packets.lock().is_empty(),
+            "no-FEC timeout must requeue the pre-FEC batch for the next drain"
+        );
+    }
+
     /// A refused datagram before/while the peer is silent means the peer is
     /// gone (cold port, server restart): close so the client accept-loop
     /// redials instead of waiting for dead_link or the keepalive timeout.

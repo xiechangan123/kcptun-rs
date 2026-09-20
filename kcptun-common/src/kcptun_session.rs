@@ -917,27 +917,35 @@ async fn write_loop(
         let fin_ids =
             smux.prepare_outbound_into_controlled(&mut out, 64 * 1024, smux.version(), allow_fin);
 
-        // Match the production loop's stream cleanup semantics.
+        // Reap stale streams via Session::remove_stream so receive-window
+        // tokens for unread buffered bytes are recycled. A bare map remove +
+        // close leaked those tokens; under YouTube-scale concurrent streams
+        // (browser cancel / 0-recv pipes with unread SMUX data) the session
+        // token bucket went permanently negative, read_loop parked, KCP
+        // advertised rmt_wnd=0, and the whole session went mute.
         {
-            let streams = smux.streams();
-            let mut stream_map = streams.lock();
             let linger = Duration::from_secs(30);
-            let stale: Vec<u32> = stream_map
-                .iter()
-                .filter(|(_, stream)| {
-                    (stream.is_local_closed() && stream.is_remote_closed() && stream.is_fin_sent())
-                        || (stream.is_local_closed()
-                            && stream.pending_send() == 0
-                            && stream
-                                .local_closed_elapsed()
-                                .is_some_and(|elapsed| elapsed >= linger))
-                })
-                .map(|(id, _)| *id)
-                .collect();
+            let streams = smux.streams();
+            let stale: Vec<u32> = {
+                let stream_map = streams.lock();
+                stream_map
+                    .iter()
+                    .filter(|(_, stream)| {
+                        (stream.is_local_closed()
+                            && stream.is_remote_closed()
+                            && stream.is_fin_sent())
+                            || (stream.is_local_closed()
+                                && stream.pending_send() == 0
+                                && stream
+                                    .local_closed_elapsed()
+                                    .is_some_and(|elapsed| elapsed >= linger))
+                    })
+                    .map(|(id, _)| *id)
+                    .collect()
+            };
+            drop(streams);
             for id in stale {
-                if let Some(stream) = stream_map.remove(&id) {
-                    stream.close();
-                }
+                smux.remove_stream(id);
             }
         }
 

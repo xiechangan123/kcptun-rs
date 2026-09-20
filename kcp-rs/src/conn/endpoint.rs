@@ -15,6 +15,14 @@ const INPUT_BATCH_GROW: usize = 16;
 /// Max datagrams processed per input-loop cycle. Bounds one `feed_inbound_batch`
 /// + deferred flush so a high-rate peer cannot starve the worker (v3 §5.4).
 const MAX_INPUT_BATCH: usize = 64;
+/// Bound on how long any sender holds the `is_sending` token across an async
+/// `flush_tx_batch`. Mirrors `spawn_send_remainder`. Without this, a
+/// `writable()` wait that never completes mutes the whole session (ACKs,
+/// retransmits, keepalives) until the peer watchdog tears it down — seen live
+/// under YouTube-sized concurrent downlink as `write_blocked_ms == out_age_ms`
+/// growing past 100 s with `wait_send` pinned at `snd_wnd` and kernel
+/// `tx_queue = 0`.
+const TX_FLUSH_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// A session must have received at least this many in-order segments before a
 /// segment numbered 0 counts as a *new generation* rather than a duplicate of
@@ -130,6 +138,31 @@ fn is_fatal_udp_error(e: &io::Error) -> bool {
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::BrokenPipe
     )
+}
+
+/// RAII release for the single-owner send token.
+///
+/// The token must come back even when the task holding it is cancelled. The
+/// stream write path (`try_drain_and_send`) holds it across
+/// `flush_tx_batch(...).await`, and a stream closing mid-send drops that
+/// future — the `finish_sending()` after the await then never runs and the
+/// token stays taken for the rest of the session's life. Everything that sends
+/// checks the token, so the session goes permanently mute: no ACKs, no
+/// retransmits, no keepalives, until the peer's own timers tear it down. Seen
+/// live as `out_age_ms == write_blocked_ms` growing past 131 s while the peer
+/// window was open and the kernel send queue was empty (nothing was even being
+/// handed to the socket).
+///
+/// The synchronous paths do not need it: `drain_and_flush_tx` has no await to
+/// be cancelled in, and it deliberately hands the token to
+/// `spawn_send_remainder`, whose task takes its own guard.
+struct SendToken<'a>(&'a SharedIoState);
+
+impl Drop for SendToken<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.0.finish_sending();
+    }
 }
 
 impl SharedIoState {
@@ -385,6 +418,10 @@ impl SharedIoState {
         let shared = self.clone();
         drop(knet::spawn_task(async move {
             let used_fec = fec_wire.is_some();
+            // The task owns the send token for its whole life; the guard also
+            // covers it being aborted (worker shutdown), which would otherwise
+            // leak the token and mute the session.
+            let _token = SendToken(&shared);
             // Race the async send against a 50ms deadline. If the socket stays
             // un-writable or the task is starved, release the token so the
             // flush loop can drain pending ACKs.
@@ -406,7 +443,6 @@ impl SharedIoState {
                     // fec_wire is a fresh Vec from fec_expand_packets (not
                     // pool-backed); dropping it is the recycle.
                     shared.recycle_raw_packets(packets);
-                    shared.finish_sending();
                 }
                 Err(_) => {
                     // Timed out: the future was cancelled mid-send. Split the
@@ -425,8 +461,8 @@ impl SharedIoState {
                         shared.recycle_raw_packets(already_sent);
                         shared.requeue_raw_packets_front(unsent);
                     }
-                    // finish_sending notifies when pending is non-empty.
-                    shared.finish_sending();
+                    // `_token` drops here, which notifies when pending is
+                    // non-empty.
                 }
             }
         }));
@@ -520,20 +556,49 @@ impl SharedIoState {
         {
             return false; // flush loop is sending — let it handle our packets
         }
+        // Released on every exit path, including this future being dropped
+        // mid-send (stream closed) — a leaked token mutes the session's TX.
+        let _token = SendToken(self);
         let packets = self.drain_raw_packets();
         if packets.is_empty() {
-            self.finish_sending();
             return true; // nothing to send, but we acquired the token (no notify needed)
         }
-        // Try non-blocking sendmmsg first (sync fast path); falls back to
-        // async send_batch on WouldBlock. Avoids a reactor scheduling hop
-        // per burst when the kernel send buffer has room.
-        if let Err(e) = self.flush_tx_batch(&packets).await {
-            self.note_io_error(e);
-        }
-        self.recycle_raw_packets(packets);
-        self.finish_sending();
+        self.send_drained_batch(packets).await;
         true
+    }
+
+    /// Send a drained `raw_packets` batch under the caller-held send token,
+    /// bounding the async flush so a parked `writable()` cannot mute the session.
+    ///
+    /// On timeout:
+    /// - **no FEC:** requeue the pre-FEC batch at the front of `raw_packets`
+    ///   for the next drain (duplicates are fine; KCP ignores them).
+    /// - **FEC:** do *not* requeue — `flush_tx_batch` already expanded into a
+    ///   Reed-Solomon wire group; a second expand would desynchronize the
+    ///   encoder/decoder pair. Recovery is left to KCP retransmission.
+    async fn send_drained_batch(&self, packets: Vec<Bytes>) {
+        if packets.is_empty() {
+            return;
+        }
+        let used_fec = self.fec_encoder.is_some();
+        // Try non-blocking sendmmsg first (sync fast path); falls back to
+        // async send_batch on WouldBlock, itself capped by TX_FLUSH_TIMEOUT.
+        match knet::timeout(TX_FLUSH_TIMEOUT, self.flush_tx_batch(&packets)).await {
+            Ok(Ok(())) => self.recycle_raw_packets(packets),
+            Ok(Err(e)) => {
+                self.note_io_error(e);
+                self.recycle_raw_packets(packets);
+            }
+            Err(_) => {
+                // Timed out inside flush_tx_batch. Token still held by the
+                // caller's SendToken; it drops after we return.
+                if used_fec {
+                    self.recycle_raw_packets(packets);
+                } else {
+                    self.requeue_raw_packets_front(packets);
+                }
+            }
+        }
     }
 
     /// Inline `kcp.send` + `kcp.flush` under the KCP lock, matching kcp-go's
@@ -999,17 +1064,14 @@ pub(crate) fn spawn_flush_loop(shared: Arc<SharedIoState>) -> knet::JoinHandle<(
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok();
                 if fast_acquired {
+                    // RAII + bounded flush: a parked writable() must not hold
+                    // the single-sender token across the rest of this loop.
+                    let _token = SendToken(&shared);
                     let fast_packets = shared.drain_raw_packets();
                     if !fast_packets.is_empty() {
-                        // Try non-blocking sendmmsg first (sync fast path);
-                        // falls back to async send_batch on WouldBlock.
-                        if let Err(e) = shared.flush_tx_batch(&fast_packets).await {
-                            shared.note_io_error(e);
-                        }
                         crate::snmp::add(&crate::snmp::DEFAULT_SNMP.write_flush_sends, 1);
                     }
-                    shared.recycle_raw_packets(fast_packets);
-                    shared.finish_sending();
+                    shared.send_drained_batch(fast_packets).await;
                 }
             }
 
@@ -1061,17 +1123,12 @@ pub(crate) fn spawn_flush_loop(shared: Arc<SharedIoState>) -> knet::JoinHandle<(
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok();
             if second_acquired {
+                let _token = SendToken(&shared);
                 let packets = shared.drain_raw_packets();
                 if !packets.is_empty() {
-                    // Try non-blocking sendmmsg first (sync fast path);
-                    // falls back to async send_batch on WouldBlock.
-                    if let Err(e) = shared.flush_tx_batch(&packets).await {
-                        shared.note_io_error(e);
-                    }
                     crate::snmp::add(&crate::snmp::DEFAULT_SNMP.write_flush_sends, 1);
                 }
-                shared.recycle_raw_packets(packets);
-                shared.finish_sending();
+                shared.send_drained_batch(packets).await;
             } else {
                 // Writer is sending — ensure we wake to retry sending these
                 // packets on the next iteration.

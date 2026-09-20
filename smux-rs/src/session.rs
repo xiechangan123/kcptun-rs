@@ -484,6 +484,9 @@ impl Session {
                         if !frame.data.is_empty() {
                             self.consume_tokens(frame.data.len());
                             if let Err(e) = stream.push_data_bytes(frame.data.clone()) {
+                                // Push failed — the bytes were not buffered, so
+                                // the charge must come back or the window leaks.
+                                self.return_tokens(frame.data.len());
                                 log::warn!(
                                     "push_data overflow FIN stream {}: {:?}",
                                     frame.stream_id,
@@ -502,6 +505,8 @@ impl Session {
                         // reference-counted Bytes slice from the codec buffer.
                         self.consume_tokens(frame.data.len());
                         if let Err(e) = stream.push_data_bytes(frame.data.clone()) {
+                            // Not buffered → give the receive window back.
+                            self.return_tokens(frame.data.len());
                             log::warn!(
                                 "push_data overflow DATA stream {}: {:?}",
                                 frame.stream_id,
