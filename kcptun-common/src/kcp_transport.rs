@@ -29,6 +29,27 @@ use kcrypt_rs::wire::{
 
 use crate::RateLimiter;
 
+/// How long the transport waits for the shared blocking pool before
+/// encrypting inline instead (see `encrypt_with`).
+const ENCRYPT_CPU_BLOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Warn at most once per 30 s when encrypt offload overflows to inline.
+fn warn_encrypt_offload_overflow() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_WARN_MS: AtomicU64 = AtomicU64::new(0);
+    let now = knet::mono_ms();
+    let last = LAST_WARN_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= 30_000
+        && LAST_WARN_MS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        log::warn!(
+            "crypto transport: encrypt offload exceeded {ENCRYPT_CPU_BLOCK_WAIT:?}, encrypting inline (blocking pool starved?)"
+        );
+    }
+}
+
 /// Default conversation ID used as CryptoBuf session_id seed (matches client).
 const DEFAULT_CONV: u32 = 0xDEAD_BEEF;
 /// Distinct seed for ACK-path CryptoBuf so nonces never collide with data path.
@@ -171,16 +192,41 @@ impl CryptoTransport {
             );
         let allow_parallel = !use_cpu_block;
         if use_cpu_block {
-            // Heavy cipher + large batch: offload to the blocking pool so the
-            // reactor can keep draining UDP / processing ACKs (matches the
-            // legacy binary flush path; M0.2 — was previously done inline).
-            let crypt = self.crypt.clone();
-            let cb = crypto_buf.clone();
+            // Bound the offload wait: the blocking pool is shared by every CPU
+            // offload, so if all its workers are occupied the transport's send
+            // path must degrade to inline work instead of parking here with no
+            // bound (same posture as the write loop's Snappy offload; the
+            // unbounded variant let a starved pool mute whole sessions —
+            // bugs/BUGREPORT_TCPRAW_ACCEPT_STARVES_CPU_POOL.md). The job gets a
+            // refcounted clone of the packets; on timeout the originals are
+            // still owned here and the fallback encrypts inline.
+            let job_packets = packets.clone();
+            let job_crypt = self.crypt.clone();
+            let job_cb = crypto_buf.clone();
             let has_encryption = self.has_encryption;
-            knet::cpu_block(move || {
-                encrypt_batch(packets, crypt.as_ref(), &cb, has_encryption, allow_parallel)
-            })
+            match knet::timeout(
+                ENCRYPT_CPU_BLOCK_WAIT,
+                knet::cpu_block(move || {
+                    encrypt_batch(job_packets, job_crypt.as_ref(), &job_cb, has_encryption, false)
+                }),
+            )
             .await
+            {
+                Ok(out) => out,
+                Err(_) => {
+                    warn_encrypt_offload_overflow();
+                    let mut out = Vec::with_capacity(packets.len());
+                    encrypt_batch_into(
+                        packets,
+                        self.crypt.as_ref(),
+                        crypto_buf,
+                        self.has_encryption,
+                        false,
+                        &mut out,
+                    );
+                    out
+                }
+            }
         } else {
             let mut out = Vec::with_capacity(packets.len());
             encrypt_batch_into(
