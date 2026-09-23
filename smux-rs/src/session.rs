@@ -265,13 +265,17 @@ impl Session {
     /// Rebuild the COW stream snapshot from the HashMap.
     ///
     /// Call this after any insert/remove/drain on `streams`.
+    ///
+    /// Both `streams` and `stream_snapshot` locks are held for the full
+    /// duration so that a concurrent caller cannot collect an older set of
+    /// streams and then overwrite a newer snapshot (lost-update race).
     fn rebuild_snapshot(&self) {
+        let mut snapshot_slot = self.stream_snapshot.lock();
         let pairs: Vec<(u32, Arc<Stream>)> = {
             let streams = self.streams.lock();
             streams.iter().map(|(&id, s)| (id, s.clone())).collect()
         };
-        let new_snapshot = Arc::from(pairs.into_boxed_slice());
-        *self.stream_snapshot.lock() = new_snapshot;
+        *snapshot_slot = Arc::from(pairs.into_boxed_slice());
     }
 
     /// Get a snapshot of all active streams for lock-free iteration.
@@ -630,6 +634,9 @@ impl Session {
     /// Reap streams that are fully closed, or local-closed past `linger` without
     /// a peer FIN (zombie half-open streams under proxy short-connect load).
     ///
+    /// The linger branch requires `pending_send() == 0` so that a stream with
+    /// queued outbound data is not force-removed before its data is delivered.
+    ///
     /// Returns stream ids that still need a wire FIN before/while being removed
     /// (`!fin_sent`). Callers should encode FIN for those ids, then treat them as
     /// gone from the map (this method already `remove`s + `close`s).
@@ -651,7 +658,7 @@ impl Session {
                 continue;
             }
 
-            if local {
+            if local && s.pending_send() == 0 {
                 if let Some(elapsed) = s.local_closed_elapsed() {
                     if elapsed >= linger {
                         // Timed out waiting for peer FIN — force remove.
@@ -1590,5 +1597,132 @@ mod tests {
         frame.encode(&mut buf);
         assert!(session.process_data(&buf).is_err());
         assert!(session.is_closed());
+    }
+
+    // ── BUG-3 regression: push_data_bytes enforces per-stream capacity ──
+
+    #[test]
+    fn bug3_push_data_bytes_returns_overflow_beyond_max_recv_buf() {
+        let cfg = Config {
+            max_stream_buffer: 16,
+            ..DEFAULT_CONFIG.clone()
+        };
+        let session = Session::new_client(&cfg).unwrap();
+        let s = session.open_stream().unwrap();
+
+        // First push within capacity succeeds.
+        assert!(s.push_data_bytes(Bytes::from_static(&[1u8; 16])).is_ok());
+
+        // Second push overflows → Err(BufferOverflow).
+        let result = s.push_data_bytes(Bytes::from_static(&[1u8; 1]));
+        assert!(
+            matches!(result, Err(ref e) if matches!(e, crate::stream::StreamError::BufferOverflow)),
+            "expected BufferOverflow, got {:?}",
+            result
+        );
+
+        // The session's Err branch (return_tokens) must fire on overflow.
+        let initial_bucket = session.token_bucket_value();
+        let frame = Frame::new(Cmd::Psh, s.id(), Bytes::from_static(&[1u8; 17]))
+            .with_ver(session.version());
+        let mut buf = Vec::new();
+        frame.encode(&mut buf);
+        session.process_data(&buf).unwrap();
+        // 17 bytes charged, then push overflowed → 17 returned.
+        assert_eq!(
+            session.token_bucket_value(),
+            initial_bucket,
+            "overflow must return tokens, not leak them"
+        );
+    }
+
+    // ── BUG-4 regression: rebuild_snapshot no lost-update race ──
+
+    #[test]
+    fn bug4_rebuild_snapshot_holds_locks_together() {
+        // The race: T1 collects {A,B} then drops streams lock; T2 inserts C,
+        // collects {A,B,C}, stores snapshot; T1 stores {A,B} → C lost.
+        // After the fix, snapshot_slot is held across streams lock, so T2's
+        // rebuild_snapshot blocks until T1 finishes.
+        //
+        // We can't easily interleave two threads in a unit test, but we CAN
+        // verify the invariant: after every insert+rebuild, the snapshot
+        // contains exactly the streams in the map. Do it rapidly.
+        let session = Session::new_client(&DEFAULT_CONFIG).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..50 {
+            let s = session.open_stream().unwrap();
+            ids.push(s.id());
+            // Simulate concurrent accept by inserting another stream.
+            let _s2 = session.accept_stream(10_000 + i).unwrap();
+        }
+        let snapshot = session.stream_snapshot();
+        let snapshot_ids: std::collections::HashSet<u32> =
+            snapshot.iter().map(|(id, _)| *id).collect();
+        let map_ids: std::collections::HashSet<u32> = {
+            let m = session.streams.lock();
+            m.keys().copied().collect()
+        };
+        assert_eq!(
+            snapshot_ids, map_ids,
+            "snapshot diverged from map after rapid insert/remove"
+        );
+    }
+
+    // ── BUG-5 regression: reap_stale_streams pending_send guard + FIN ──
+
+    #[test]
+    fn bug5_reap_stale_streams_skips_stream_with_pending_send() {
+        let cfg = Config {
+            max_receive_buffer: 4 * 1024 * 1024,
+            max_stream_buffer: 256 * 1024,
+            ..DEFAULT_CONFIG.clone()
+        };
+        let session = Session::new_client(&cfg).unwrap();
+        let s = session.open_stream().unwrap();
+
+        // Write data first (write fails after mark_local_closed).
+        s.write(&[1u8; 64]).unwrap();
+        assert!(s.pending_send() > 0, "stream should have pending data");
+
+        s.mark_local_closed();
+
+        // Stream has pending send data → must NOT be reaped even past linger.
+
+        let need_fin = session.reap_stale_streams(Duration::from_millis(0));
+        assert!(
+            need_fin.is_empty(),
+            "stream with pending_send should not be reaped"
+        );
+        // Stream is still in the map.
+        assert!(session.streams.lock().contains_key(&s.id()));
+
+        // Drain the send buffer → now reapable.
+        let mut buf = bytes::BytesMut::new();
+        let _ = session.prepare_outbound_into(&mut buf, 1024, 1);
+        assert_eq!(s.pending_send(), 0);
+
+        let need_fin = session.reap_stale_streams(Duration::from_millis(0));
+        // local_closed + pending_send==0 + linger=0 → reaped.
+        // !fin_sent → need_fin should contain the id.
+        assert!(
+            need_fin.contains(&s.id()),
+            "stream should be reaped with FIN needed, got {:?}",
+            need_fin
+        );
+        assert!(!session.streams.lock().contains_key(&s.id()));
+    }
+
+    #[test]
+    fn bug5_reap_stale_streams_fully_closed_no_fin_needed() {
+        let session = Session::new_client(&DEFAULT_CONFIG).unwrap();
+        let s = session.open_stream().unwrap();
+        s.mark_local_closed();
+        s.mark_remote_closed();
+        s.mark_fin_sent();
+
+        let need_fin = session.reap_stale_streams(Duration::from_millis(0));
+        assert!(need_fin.is_empty(), "fully closed stream needs no FIN");
+        assert!(!session.streams.lock().contains_key(&s.id()));
     }
 }

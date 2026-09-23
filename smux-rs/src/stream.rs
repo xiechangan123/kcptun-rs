@@ -391,11 +391,20 @@ impl Stream {
     }
 
     /// Push incoming data as a `Bytes` (zero-copy append).
+    ///
+    /// Returns `Err(BufferOverflow)` when the per-stream receive buffer
+    /// exceeds `max_recv_buf`. The caller (session `process_data`) must
+    /// `return_tokens` on error so the session-level receive window is
+    /// not leaked.
     pub fn push_data_bytes(&self, data: Bytes) -> Result<(), StreamError> {
         if data.is_empty() {
             return Ok(());
         }
         let n = data.len();
+        let current = self.recv_buf_bytes_avail.load(Ordering::Relaxed);
+        if current + n > self.max_recv_buf {
+            return Err(StreamError::BufferOverflow);
+        }
         {
             let mut inner = self.recv.lock();
             inner.recv.push_back(data);

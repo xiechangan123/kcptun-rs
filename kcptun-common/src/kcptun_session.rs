@@ -959,35 +959,25 @@ async fn write_loop(
         let fin_ids =
             smux.prepare_outbound_into_controlled(&mut out, 64 * 1024, smux.version(), allow_fin);
 
-        // Reap stale streams via Session::remove_stream so receive-window
-        // tokens for unread buffered bytes are recycled. A bare map remove +
-        // close leaked those tokens; under YouTube-scale concurrent streams
-        // (browser cancel / 0-recv pipes with unread SMUX data) the session
-        // token bucket went permanently negative, read_loop parked, KCP
-        // advertised rmt_wnd=0, and the whole session went mute.
-        {
-            let linger = Duration::from_secs(30);
-            let streams = smux.streams();
-            let stale: Vec<u32> = {
-                let stream_map = streams.lock();
-                stream_map
-                    .iter()
-                    .filter(|(_, stream)| {
-                        (stream.is_local_closed()
-                            && stream.is_remote_closed()
-                            && stream.is_fin_sent())
-                            || (stream.is_local_closed()
-                                && stream.pending_send() == 0
-                                && stream
-                                    .local_closed_elapsed()
-                                    .is_some_and(|elapsed| elapsed >= linger))
-                    })
-                    .map(|(id, _)| *id)
-                    .collect()
-            };
-            drop(streams);
-            for id in stale {
-                smux.remove_stream(id);
+        // Reap stale streams: fully-closed and linger-expired streams are
+        // removed from the session, their receive-window tokens recycled,
+        // and any linger-expired stream that never sent a FIN gets one encoded
+        // here so the peer learns the stream is gone.
+        //
+        // This was previously a hand-rolled scan that called
+        // `remove_stream` per id (O(K·N) snapshot rebuilds) and never
+        // backfilled FINs for the linger branch. Switching to
+        // `reap_stale_streams` does both in one pass.
+        let reap_need_fin = smux.reap_stale_streams(Duration::from_secs(30));
+        if !reap_need_fin.is_empty() {
+            for &id in &reap_need_fin {
+                smux_rs::Frame::encode_header_into(
+                    &mut out,
+                    smux.version(),
+                    smux_rs::Cmd::Fin,
+                    id,
+                    0,
+                );
             }
         }
 
@@ -1046,7 +1036,10 @@ async fn write_loop(
                 );
                 break;
             }
-            smux.mark_fins_sent(&fin_ids);
+            // Merge reap-issued FINs so they are marked as sent too.
+            let mut all_fin_ids = fin_ids;
+            all_fin_ids.extend_from_slice(&reap_need_fin);
+            smux.mark_fins_sent(&all_fin_ids);
 
             // `prepare_outbound_into_controlled` deliberately caps each KCP
             // write to 64 KiB. If a stream still has queued data, preserve a

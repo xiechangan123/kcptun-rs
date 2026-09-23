@@ -20,8 +20,7 @@
 ## 二、BUG-1【本次引入】超时重排重发已发送前缀
 
 **严重性**：中（带宽浪费 + 虚假快速重传；非正确性损坏）
-**状态**：未修
-**位置**：`kcp-rs/src/conn/endpoint.rs:592-600`（`send_drained_batch` 的 `Err(_)` 分支）
+**状态**：已修（`tx_delivered` 原子计数器 + 超时按已交付数切分）
 
 ### 证据
 
@@ -68,8 +67,8 @@ Err(_) => {
 ## 三、BUG-2【既存 `b19fbf7c`】`spawn_send_remainder` 超时分支变量语义颠倒
 
 **严重性**：中（未发送数据被静默丢弃、已发送数据被重发）
-**状态**：未修
-**位置**：`kcp-rs/src/conn/endpoint.rs:456-462`
+**状态**：已修（`split_off` 变量语义纠正：前缀回收、后缀重排）
+**位置**：`kcp-rs/src/conn/endpoint.rs:456-468`
 
 ### 证据
 
@@ -116,8 +115,8 @@ shared.requeue_raw_packets_front(already_sent); // [sent..] 未发送，放回�
 ## 四、BUG-3【本次引入】`push_data_bytes` 失败分支不可达，修复未生效
 
 **严重性**：低（无害死代码），但**提交信息与 handoff 文档高估了修复覆盖面**
-**状态**：未修
-**位置**：`smux-rs/src/session.rs:489`（FIN-with-data）、`smux-rs/src/session.rs:509`（PSH）
+**状态**：已修（`push_data_bytes` 加 `max_recv_buf` 容量上限检查，溢出返回 `BufferOverflow`）
+**位置**：`smux-rs/src/stream.rs:394-411`（`push_data_bytes`）；`smux-rs/src/session.rs:489/509` 的 `Err` 分支现为有效防线
 
 ### 证据
 
@@ -149,8 +148,8 @@ pub fn push_data_bytes(&self, data: Bytes) -> Result<(), StreamError> {
 ## 五、BUG-4【既存，被本次放大】`rebuild_snapshot` 丢更新竞态
 
 **严重性**：中低（概率低，后果为流数据短暂不被排空）
-**状态**：未修
-**位置**：`smux-rs/src/session.rs:268-275`；本次新增调用点 `kcptun-common/src/kcptun_session.rs:948`
+**状态**：已修（收集 + 存快照合并到同一把 `streams` 锁内，消除交错写入）
+**位置**：`smux-rs/src/session.rs:268-280`
 
 ### 证据
 
@@ -177,7 +176,9 @@ fn rebuild_snapshot(&self) {
 
 ## 六、残留缺口：token 回收仍晚于 Go；reap 逻辑重复实现
 
-**位置**：`kcptun-common/src/kcptun_session.rs:920-950`；对照 `smux-rs/src/session.rs:639-684`
+**状态**：部分修复。§6.2 的 reap 重复实现已收敛到 `reap_stale_streams`（含 `pending_send()==0` 守卫 + linger 分支 FIN 补发）；§6.1 的 token 回收时机仍晚于 Go（需在 `Stream::close` 时提前回收，当前仍在 reap 时回收）。
+
+**位置**：`kcptun-common/src/kcptun_session.rs:962-982`（write_loop reap）；对照 `smux-rs/src/session.rs:643-690`（`reap_stale_streams`）
 
 ### 6.1 回收时机
 

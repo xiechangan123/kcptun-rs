@@ -1356,6 +1356,7 @@ impl KcpStreamBuilder {
             last_activity_ms: AtomicU64::new(knet::mono_ms()),
             last_rx_ms: AtomicU64::new(knet::mono_ms()),
             is_sending: AtomicBool::new(false),
+            tx_delivered: AtomicUsize::new(0),
             fec_encoder,
             fec_decoder,
             read_timeout: Mutex::new(None),
@@ -2055,5 +2056,171 @@ mod integ {
                 Err(_) => continue,
             }
         }
+    }
+
+    // ── BUG-1 / BUG-2 regression tests ───────────────────────────────────
+
+    /// Transport that accepts a configurable prefix via `try_send_batch`,
+    /// then parks forever on the async suffix. Used to verify that
+    /// `send_drained_batch` timeout only requeues the *unsent* suffix and
+    /// recycles the already-delivered prefix.
+    struct PrefixThenParkTransport {
+        /// Number of packets `try_send_batch` accepts (0 = WouldBlock).
+        try_accept: usize,
+        /// Records what was accepted via `try_send_batch`.
+        sync_sent: Mutex<Vec<Bytes>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PacketTransport for PrefixThenParkTransport {
+        async fn recv(&self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+        fn try_recv(&self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+        async fn send_batch(&self, _packets: &[Bytes]) -> io::Result<()> {
+            std::future::pending::<io::Result<()>>().await
+        }
+        async fn send_batch_to(&self, _packets: &[Bytes], _t: SocketAddr) -> io::Result<()> {
+            std::future::pending::<io::Result<()>>().await
+        }
+        fn try_send_batch(&self, packets: &[Bytes]) -> io::Result<usize> {
+            if self.try_accept == 0 {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+            let n = self.try_accept.min(packets.len());
+            self.sync_sent.lock().extend_from_slice(&packets[..n]);
+            Ok(n)
+        }
+        fn try_send_batch_to(&self, packets: &[Bytes], _t: SocketAddr) -> io::Result<usize> {
+            self.try_send_batch(packets)
+        }
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(SocketAddr::from(([127, 0, 0, 1], 0)))
+        }
+    }
+
+    /// BUG-1 regression: when `send_drained_batch` times out after a prefix
+    /// was handed to the kernel, only the unsent suffix must be requeued.
+    /// The already-delivered prefix must not be replayed.
+    #[tokio::test]
+    async fn bug1_timeout_requeues_only_unsent_suffix() {
+        let transport = Arc::new(PrefixThenParkTransport {
+            try_accept: 2,
+            sync_sent: Mutex::new(Vec::new()),
+        });
+        let conn = KcpStream::with_transport(
+            transport.clone() as Arc<dyn PacketTransport>,
+            SocketAddr::from(([127, 0, 0, 1], 9)),
+        )
+        .connected(true)
+        .background_input(false)
+        .spawn_flush_loop(false)
+        .build()
+        .await
+        .unwrap();
+
+        let p0 = Bytes::from_static(b"p0");
+        let p1 = Bytes::from_static(b"p1");
+        let p2 = Bytes::from_static(b"p2");
+        let p3 = Bytes::from_static(b"p3");
+        conn.shared.raw_packets.lock().push(p0.clone());
+        conn.shared.raw_packets.lock().push(p1.clone());
+        conn.shared.raw_packets.lock().push(p2.clone());
+        conn.shared.raw_packets.lock().push(p3.clone());
+
+        let started = std::time::Instant::now();
+        let acquired = conn.shared.try_drain_and_send().await;
+        assert!(acquired);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "bounded flush took {:?}",
+            started.elapsed()
+        );
+
+        // The prefix [p0, p1] was accepted by try_send_batch.
+        let sync = transport.sync_sent.lock();
+        assert_eq!(sync.len(), 2);
+        assert_eq!(sync[0], p0);
+        assert_eq!(sync[1], p1);
+        drop(sync);
+
+        // The requeued suffix must be [p2, p3], NOT [p0, p1, p2, p3].
+        let requeued = conn.shared.drain_raw_packets();
+        assert_eq!(
+            requeued.len(),
+            2,
+            "only the unsent suffix should be requeued, got {:?}",
+            requeued.iter().map(|b| b.as_ref()).collect::<Vec<_>>()
+        );
+        assert_eq!(requeued[0], p2);
+        assert_eq!(requeued[1], p3);
+    }
+
+    /// BUG-2 regression: `spawn_send_remainder` timeout must recycle the
+    /// already-sent prefix and requeue the unsent suffix — not the reverse.
+    #[tokio::test]
+    async fn bug2_spawn_send_remainder_recycles_prefix_requeues_suffix() {
+        let transport = Arc::new(PrefixThenParkTransport {
+            try_accept: 2,
+            sync_sent: Mutex::new(Vec::new()),
+        });
+        let conn = KcpStream::with_transport(
+            transport.clone() as Arc<dyn PacketTransport>,
+            SocketAddr::from(([127, 0, 0, 1], 9)),
+        )
+        .connected(true)
+        .background_input(false)
+        .spawn_flush_loop(false)
+        .build()
+        .await
+        .unwrap();
+
+        let p0 = Bytes::from_static(b"a0");
+        let p1 = Bytes::from_static(b"a1");
+        let p2 = Bytes::from_static(b"a2");
+        let p3 = Bytes::from_static(b"a3");
+        conn.shared.raw_packets.lock().push(p0.clone());
+        conn.shared.raw_packets.lock().push(p1.clone());
+        conn.shared.raw_packets.lock().push(p2.clone());
+        conn.shared.raw_packets.lock().push(p3.clone());
+
+        // `drain_and_flush_tx` is sync: it does try_send_batch (accepts 2),
+        // then spawns a continuation for the rest.
+        let acquired = conn.shared.drain_and_flush_tx();
+        assert!(acquired, "should have taken the send token");
+
+        // Wait for the continuation to time out and requeue the suffix.
+        knet::timeout(Duration::from_millis(500), async {
+            loop {
+                let q = conn.shared.raw_packets.lock();
+                if !q.is_empty() {
+                    break;
+                }
+                drop(q);
+                knet::yield_now().await;
+            }
+        })
+        .await
+        .expect("continuation did not requeue in time");
+
+        // try_send_batch accepted the first 2.
+        let sync = transport.sync_sent.lock();
+        assert_eq!(sync.len(), 2);
+        assert_eq!(sync[0], p0);
+        assert_eq!(sync[1], p1);
+        drop(sync);
+
+        // Requeued suffix must be [a2, a3].
+        let requeued = conn.shared.drain_raw_packets();
+        assert_eq!(
+            requeued.len(),
+            2,
+            "only unsent suffix should be requeued, got {:?}",
+            requeued.iter().map(|b| b.as_ref()).collect::<Vec<_>>()
+        );
+        assert_eq!(requeued[0], p2);
+        assert_eq!(requeued[1], p3);
     }
 }

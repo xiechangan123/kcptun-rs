@@ -91,6 +91,11 @@ pub struct SharedIoState {
     /// Prevents wire-interleaving when both try to send concurrently.
     /// Acquired via `compare_exchange(false, true)`; released with `store(false)`.
     pub(crate) is_sending: AtomicBool,
+    /// Pre-FEC packet count already handed to the kernel inside the current
+    /// `flush_tx_batch` call. Read by `send_drained_batch` after a timeout to
+    /// split the batch at the right boundary: only the unsent suffix is
+    /// requeued, avoiding replay of datagrams the kernel already accepted.
+    pub(crate) tx_delivered: AtomicUsize,
     /// Optional FEC encoder (header_offset=0, matching client/server session layout).
     pub(crate) fec_encoder: Option<Mutex<FecEncoder>>,
     /// Optional FEC decoder.
@@ -295,9 +300,10 @@ impl SharedIoState {
 
     /// Put a batch back at the front of the pending send queue (FIFO).
     ///
-    /// Used when `spawn_send_remainder` times out: the unsent suffix is
-    /// returned so the flush loop's next drain retries it immediately,
-    /// instead of waiting for KCP's RTO to retransmit those segments.
+    /// Used when `spawn_send_remainder` or `send_drained_batch` times out:
+    /// the unsent suffix is returned so the flush loop's next drain retries
+    /// it immediately, instead of waiting for KCP's RTO to retransmit those
+    /// segments.
     /// Callers must only requeue **pre-FEC** packets — an already-expanded
     /// wire batch would be FEC-expanded a second time and land in a new
     /// Reed-Solomon group.
@@ -401,17 +407,17 @@ impl SharedIoState {
     /// send token is released so ACKs are not blocked behind a starved task.
     ///
     /// On timeout the unsent suffix is handled as follows:
-    /// - **No FEC:** the suffix is requeued at the front of `raw_packets` so
-    ///   the flush loop retries it on its next drain (much sooner than KCP's
-    ///   RTO). The cancelled future may already have handed some of those
-    ///   datagrams to the kernel — duplicates are fine; KCP ignores them.
+    /// - **No FEC:** the prefix [0..sent) was already handed to the kernel;
+    ///   its capacity is recycled. The suffix [sent..len) is requeued at the
+    ///   front of `raw_packets` so the flush loop retries it on its next drain
+    ///   (much sooner than KCP's RTO).
     /// - **FEC:** the suffix is *not* requeued. `raw_packets` holds pre-FEC
     ///   packets and the next `flush_tx_batch` would expand them into a
     ///   *new* Reed-Solomon group, desynchronizing the encoder/decoder pair.
     ///   Recovery is left to KCP retransmission of the still-unacked segments.
     pub(crate) fn spawn_send_remainder(
         self: &Arc<Self>,
-        packets: Vec<Bytes>,
+        mut packets: Vec<Bytes>,
         fec_wire: Option<Vec<Bytes>>,
         sent: usize,
     ) {
@@ -454,11 +460,13 @@ impl SharedIoState {
                         shared.recycle_raw_packets(packets);
                     } else {
                         let split = sent.min(packets.len());
-                        let mut unsent = packets;
-                        let already_sent = unsent.split_off(split);
-                        // Prefix reached the kernel; only its capacity is worth
-                        // recycling. The suffix is requeued for retry.
-                        shared.recycle_raw_packets(already_sent);
+                        // split_off(split) returns [split..len) and leaves
+                        // [0..split) in `packets`. The prefix [0..split) was
+                        // handed to the kernel — recycle its capacity. The
+                        // suffix [split..len) was not sent — requeue it for
+                        // an immediate flush-loop retry.
+                        let unsent = packets.split_off(split);
+                        shared.recycle_raw_packets(packets);
                         shared.requeue_raw_packets_front(unsent);
                     }
                     // `_token` drops here, which notifies when pending is
@@ -491,6 +499,13 @@ impl SharedIoState {
     ///
     /// Returns `Ok(())` on success. On `WouldBlock`, the async send path
     /// runs and its result is returned.
+    ///
+    /// Updates `tx_delivered` with the count of pre-FEC packets already
+    /// handed to the kernel. This is read by `send_drained_batch` after a
+    /// timeout to split the batch: only the unsent suffix is requeued,
+    /// avoiding replay of datagrams the kernel already accepted (which
+    /// would waste bandwidth on a congested link and trigger spurious fast
+    /// retransmits under `fastresend >= 2`).
     pub(crate) async fn flush_tx_batch(&self, packets: &[Bytes]) -> io::Result<()> {
         // FEC-expand if configured (sync).
         let wire: Vec<Bytes> = if let Some(ref enc) = self.fec_encoder {
@@ -513,29 +528,51 @@ impl SharedIoState {
                 self.transport.try_send_batch_to(packets, self.remote_addr)
             };
             match non_fec_result {
-                Ok(sent) if sent >= packets.len() => return Ok(()),
+                Ok(sent) if sent >= packets.len() => {
+                    self.tx_delivered.store(packets.len(), Ordering::Relaxed);
+                    return Ok(());
+                }
                 Ok(sent) => {
                     // `sendmmsg` can return a partial prefix. Send only the
                     // remaining suffix; replaying the prefix wastes bandwidth
                     // and dropping the suffix creates an artificial KCP loss.
-                    return self.send_packets(&packets[sent.min(packets.len())..]).await;
+                    self.tx_delivered.store(sent, Ordering::Relaxed);
+                    self.send_packets(&packets[sent.min(packets.len())..])
+                        .await?;
+                    self.tx_delivered.store(packets.len(), Ordering::Relaxed);
+                    return Ok(());
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    return self.send_packets(packets).await;
+                    self.send_packets(packets).await?;
+                    self.tx_delivered.store(packets.len(), Ordering::Relaxed);
+                    return Ok(());
                 }
                 Err(e) => return Err(e),
             }
         };
         // FEC path: try non-blocking, fall back to async.
+        // FEC batches are never requeued on timeout (see `send_drained_batch`
+        // docs), so `tx_delivered` is set to the full pre-FEC count on success.
         let fec_result = if self.connected {
             self.transport.try_send_batch(&wire)
         } else {
             self.transport.try_send_batch_to(&wire, self.remote_addr)
         };
         match fec_result {
-            Ok(sent) if sent >= wire.len() => Ok(()),
-            Ok(sent) => self.send_packets(&wire[sent.min(wire.len())..]).await,
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => self.send_packets(&wire).await,
+            Ok(sent) if sent >= wire.len() => {
+                self.tx_delivered.store(packets.len(), Ordering::Relaxed);
+                Ok(())
+            }
+            Ok(sent) => {
+                self.send_packets(&wire[sent.min(wire.len())..]).await?;
+                self.tx_delivered.store(packets.len(), Ordering::Relaxed);
+                Ok(())
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                self.send_packets(&wire).await?;
+                self.tx_delivered.store(packets.len(), Ordering::Relaxed);
+                Ok(())
+            }
             Err(e) => Err(e),
         }
     }
@@ -571,16 +608,23 @@ impl SharedIoState {
     /// bounding the async flush so a parked `writable()` cannot mute the session.
     ///
     /// On timeout:
-    /// - **no FEC:** requeue the pre-FEC batch at the front of `raw_packets`
-    ///   for the next drain (duplicates are fine; KCP ignores them).
+    /// - **no FEC:** split the pre-FEC batch at the point `flush_tx_batch`
+    ///   reached (tracked in `tx_delivered`). Recycle the already-delivered
+    ///   prefix; requeue only the unsent suffix at the front of `raw_packets`
+    ///   for the next drain. This avoids replaying datagrams the kernel
+    ///   already accepted, which would waste bandwidth on a congested link
+    ///   and trigger spurious fast retransmits under `fastresend >= 2`.
     /// - **FEC:** do *not* requeue — `flush_tx_batch` already expanded into a
     ///   Reed-Solomon wire group; a second expand would desynchronize the
     ///   encoder/decoder pair. Recovery is left to KCP retransmission.
-    async fn send_drained_batch(&self, packets: Vec<Bytes>) {
+    async fn send_drained_batch(&self, mut packets: Vec<Bytes>) {
         if packets.is_empty() {
             return;
         }
         let used_fec = self.fec_encoder.is_some();
+        // Reset the delivery tracker so the timeout branch reads only what
+        // this call's `flush_tx_batch` handed to the kernel.
+        self.tx_delivered.store(0, Ordering::Relaxed);
         // Try non-blocking sendmmsg first (sync fast path); falls back to
         // async send_batch on WouldBlock, itself capped by TX_FLUSH_TIMEOUT.
         match knet::timeout(TX_FLUSH_TIMEOUT, self.flush_tx_batch(&packets)).await {
@@ -593,9 +637,27 @@ impl SharedIoState {
                 // Timed out inside flush_tx_batch. Token still held by the
                 // caller's SendToken; it drops after we return.
                 if used_fec {
+                    // FEC: cannot requeue pre-FEC packets (would be expanded
+                    // into a new RS group). Recovery is left to KCP RTO.
                     self.recycle_raw_packets(packets);
                 } else {
-                    self.requeue_raw_packets_front(packets);
+                    let delivered = self.tx_delivered.load(Ordering::Relaxed);
+                    let split = delivered.min(packets.len());
+                    if split == 0 {
+                        // Nothing was handed to the kernel — requeue the
+                        // whole batch for an immediate retry.
+                        self.requeue_raw_packets_front(packets);
+                    } else if split < packets.len() {
+                        // Prefix [0..split) was delivered; recycle its
+                        // capacity. Suffix [split..len) was not — requeue.
+                        let unsent = packets.split_off(split);
+                        self.recycle_raw_packets(packets);
+                        self.requeue_raw_packets_front(unsent);
+                    } else {
+                        // Everything was delivered (timeout fired after the
+                        // last `store` but before the future completed).
+                        self.recycle_raw_packets(packets);
+                    }
                 }
             }
         }
