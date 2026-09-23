@@ -335,15 +335,16 @@ Collection is **opt-in** (`snmp_enable`) so the hot path stays free when you don
 | `with_transport(transport, remote)` | Build over an existing [`PacketTransport`](#packettransport) (e.g. `CryptoTransport`). |
 | `.connect_timeout(Duration)` | Require a first peer response (probe `WINS` / ACK) within the timeout; `build` fails with `TimedOut` otherwise. |
 | `.mtu(v)` / `.sndwnd(v)` / `.rcvwnd(v)` | Size knobs. |
-| `.mode(KcpMode)` / `.nodelay(n, i, r, c)` | Latency curve / raw knobs. |
+| `.mode(KcpMode)` / `.set_kcp_nodelay(n, i, r, c)` | Latency curve / raw knobs. |
 | `.stream(bool)` / `.acknodelay(bool)` / `.conv(v)` / `.token(v)` | Protocol knobs. |
 | `.connected(bool)` | `true` when the transport socket is already `connect()`ed (uses `send_batch`); default `true` for `connect`, `false` for `with_transport`. |
 | `.fec(data, parity)` | Enable Reed-Solomon FEC (both `> 0`). |
 | `.config(KcpConfig)` | Apply a full config value. |
 | `.build().await` | Construct and start the background loops. |
 | `read` / `write_all` / `flush` | Standard async I/O (`knet::AsyncReadExt` / `AsyncWriteExt`). |
-| `set_kcp_nodelay` / `set_kcp_window_size` / `set_kcp_mtu` / `set_kcp_stream_mode` / `set_kcp_acknodelay` | KCP-specific post-construction tuning (`set_kcp_*` prefix avoids collisions). |
-| `set_nodelay(bool)` / `nodelay()` | TCP-style Nagle toggle (`true` → KCP fast path) + getter. |
+| `set_kcp_window_size(snd, rcv)` | Post-construction window resize. MTU, stream mode, acknodelay and the raw knobs are builder-only (`.mtu` / `.stream` / `.acknodelay` / `.set_kcp_nodelay`). |
+| `set_nodelay(bool)` / `nodelay()` | Fast-path toggle (`true` → nodelay=1, interval=10; `false` → nodelay=0, interval=40) + getter. Not TCP Nagle. |
+| `set_nonblocking(bool)` | When `true`, `read` / `write_all` return `WouldBlock` instead of parking. `poll_read` / `poll_write` are unaffected. |
 | `set_read_timeout(Option<Duration>)` / `read_timeout()` | Read deadline (`TimedOut` after it elapses with no data). |
 | `set_write_timeout(Option<Duration>)` / `write_timeout()` | Write deadline when blocked on a full send window. |
 | `shutdown(std::net::Shutdown)` | Half-close: `Write` stops writes + flushes, `Read` surfaces EOF, `Both` = `close()`. |
@@ -352,7 +353,7 @@ Collection is **opt-in** (`snmp_enable`) so the hot path stays free when you don
 | `take_error()` | Last background-loop I/O error, clearing it. |
 | `split()` / `into_split()` | Borrowing / owned read+write halves (tokio-style); connection closes on last owned-half drop. |
 | `readable()` / `writable()` | Await data-available / window-open readiness. |
-| `read_shared(&mut [u8])` / `write_all_shared(&[u8])` | Concurrent `&self` read/write (used by the session layer). |
+| `read(&mut [u8])` / `write_all(&[u8])` | Concurrent `&self` read/write (the trait methods need `Pin<&mut Self>`). |
 | `close()` / `is_closed()` / `is_dead()` | Close / query state. |
 | `snd_wnd()` / `rcv_wnd()` / `wait_send()` / `last_activity_ms()` | Backpressure & activity diagnostics. |
 
@@ -364,7 +365,7 @@ Collection is **opt-in** (`snmp_enable`) so the hot path stays free when you don
 |------------------|-------------|
 | `bind(addr)` | Bind a UDP socket to `addr`; returns a `KcpListenerBuilder` (awaitable directly via `IntoFuture`, or `.build().await`). |
 | `.mtu(v)` / `.sndwnd(v)` / `.rcvwnd(v)` | Size knobs (propagated to accepted conns). |
-| `.mode(KcpMode)` / `.nodelay(n, i, r, c)` | Latency curve / raw knobs. |
+| `.mode(KcpMode)` / `.set_kcp_nodelay(n, i, r, c)` | Latency curve / raw knobs. |
 | `.stream(bool)` / `.acknodelay(bool)` / `.conv(v)` / `.token(v)` | Protocol knobs. |
 | `.fec(data, parity)` | Enable Reed-Solomon FEC on accepted conns (both `> 0`). |
 | `.config(KcpConfig)` | Apply a full config value. |
@@ -377,6 +378,8 @@ Collection is **opt-in** (`snmp_enable`) so the hot path stays free when you don
 | `close()` | Stop accepting new clients (existing accepted conns are unaffected). |
 
 `KcpListener` is **not** `Clone`; the demux reader lives inside it. Dropping the listener closes it.
+
+`KcpTcpListener` is a different type: a Linux raw-TCP **transport factory** (one accepted TCP connection → one `KcpStream`), not a demux listener. Its builder takes the same config setters as `KcpListener`.
 
 ### PacketTransport
 
@@ -517,7 +520,7 @@ cargo test -p kcp-rs --test data_correctness
 cargo test -p kcp-rs --test data_correctness reliable_delivery_with_20pct_loss
 
 # Async: KcpStream integrity over real localhost UDP
-cargo test -p kcp-rs --features async --test kcpconn_integrity
+	cargo test -p kcp-rs --features async --test kcpstream_integrity
 
 # Full crate suite
 cargo test -p kcp-rs                    # sync
@@ -529,8 +532,8 @@ cargo test -p kcp-rs --features async   # + async
 | Test file | Verifies |
 |-----------|----------|
 | `tests/data_correctness.rs` | Byte-exact delivery (length + content + FNV-1a checksum) over a clean link, a 20%-loss link, and a loss+dup+reorder+delay link; FEC recovers a dropped data shard byte-exactly. |
-| `tests/kcpconn_integrity.rs` | Bidirectional byte-exact transfers through real `KcpStream` over localhost UDP, with and without FEC 10/3. |
-| `tests/kcpconn_listener.rs` | Server **listen** / client **connect**: accept echo round-trip, multi-peer demux, listener serves a fresh client after a close. |
+| `tests/kcpstream_integrity.rs` | Bidirectional byte-exact transfers through real `KcpStream` over localhost UDP, with and without FEC 10/3. |
+| `tests/kcpstream_listener.rs` | Server **listen** / client **connect**: accept echo round-trip, multi-peer demux, listener serves a fresh client after a close. |
 
 ---
 
@@ -543,8 +546,8 @@ kcp-rs/
 ├── test.sh             — standalone test runner (sync + async)
 ├── tests/
 │   ├── data_correctness.rs   — sync reliability + FEC data-correctness tests
-│   ├── kcpconn_integrity.rs  — async KcpStream integrity over localhost UDP
-│   └── kcpconn_listener.rs   — server listen / client connect (accept, demux, reconnect)
+│   ├── kcpstream_integrity.rs — async KcpStream integrity over localhost UDP
+│   └── kcpstream_listener.rs  — server listen / client connect (accept, demux, reconnect)
 └── src/
     ├── lib.rs          — crate root + re-exports (large intentional clippy allow-list)
     ├── kcp.rs          — core KCP state machine (windows, RTO, flush, input, NoDelay)

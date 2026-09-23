@@ -66,7 +66,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use crate::config::{KcpConfig, KcpMode};
+use crate::config::KcpConfig;
 use crate::conn::{kcp_config_setters, resolve_one, KcpStream};
 use crate::transport::{TransportWrapper, MAX_DATAGRAM};
 use knet::Notify;
@@ -80,7 +80,7 @@ use knet::Notify;
 // *blocking* `recv_timeout` inside the async context, which froze the runtime
 // driver — and with it every flush-loop timer on this shard — for up to the
 // park timeout. (pprof: crossbeam `recv_deadline`+`wait_until` ≈ 7% CPU.)
-pub use knet::{
+use knet::{
     Receiver as AsyncReceiver, Sender as AsyncSender, TrySendError as AsyncTrySendError,
 };
 /// RX batch size for `try_recv_batch_from_into` (§16: 16–32 is a good starting

@@ -102,16 +102,16 @@ run_phase doctests 0 cargo test --workspace --doc
 run_phase clippy 0 cargo clippy --workspace -- -D warnings
 
 # ══ 阶段 3: 独立 crate 冒烟（feature 门控 / 专项）═════════════════════════
-run_phase kcp-async 0 cargo test -p kcp-rs --features async \
-    --test kcpconn_integrity --test kcpconn_listener -- --test-threads=2
+	run_phase kcp-async 0 cargo test -p kcp-rs --features async \
+	    --test kcpstream_integrity --test kcpstream_listener -- --test-threads=2
 run_phase ratelimit-smoke 0 cargo test -p kcptun-common ratelimit -- --nocapture
 run_phase snappy-interop 0 cargo test test_snappy_go_rust_interop -- --nocapture
 # tcpraw/KcpTcpListener 测试：仅 Linux+root（macOS 上跳过）
 if [ "$(uname -s)" = "Linux" ] && [ "$(id -u)" = 0 ]; then
-    run_phase kcp-tcpconn-root 0 cargo test -p kcp-rs --features async \
-        --test tcpconn_tcp -- --test-threads=2
-else
-    skip_phase kcp-tcpconn-root
+	    run_phase kcp-tcpstream-root 0 cargo test -p kcp-rs --features async \
+	        --test tcpstream_tcp -- --test-threads=2
+	else
+	    skip_phase kcp-tcpstream-root
 fi
 
 # ══ 阶段 4: 压力测试（release，串行）═════════════════════════════════════

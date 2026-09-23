@@ -120,10 +120,7 @@ pub struct KcpTcpListenerBuilder {
 }
 
 impl KcpTcpListenerBuilder {
-    pub fn config(mut self, cfg: KcpConfig) -> Self {
-        self.config = cfg;
-        self
-    }
+    crate::conn::kcp_config_setters!();
 
     /// Bind the raw-TCP listener and return it.
     pub fn build(self) -> io::Result<KcpTcpListener> {

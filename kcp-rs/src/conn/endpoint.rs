@@ -54,7 +54,7 @@ impl TxProgress {
 /// handful.
 pub(crate) const RESTART_MIN_RCV_NXT: u32 = 16;
 
-pub struct SharedIoState {
+pub(crate) struct SharedIoState {
     pub(crate) transport: Arc<dyn PacketTransport>,
     pub(crate) kcp: Arc<Mutex<KCP>>,
     // read_buf is a small byte-bounded prefetch queue plus a possible partial
@@ -100,7 +100,8 @@ pub struct SharedIoState {
     /// instead of feeding the new conversation into it.
     pub(crate) peer_restart: AtomicU64,
     /// When false, no background input-loop task is spawned: an external
-    /// driver (Acceptor + Worker sharding) feeds inbound via [`KcpStream::feed_input`].
+    /// driver (the listener worker pipeline) feeds inbound via
+    /// [`KcpStream::feed_raw_batch`].
     pub(crate) background_input: bool,
     /// Last successful inbound or outbound user-data activity (monotonic ms).
     pub(crate) last_activity_ms: AtomicU64,
@@ -120,10 +121,10 @@ pub struct SharedIoState {
 
     // ── TcpStream-aligned surface ──
     /// Read timeout in ms (`None` = block indefinitely). Honored by
-    /// [`KcpStream::read_shared`], `poll_read`, and [`KcpStream::readable`].
+    /// [`KcpStream::read`], `poll_read`, and [`KcpStream::readable`].
     pub(crate) read_timeout: Mutex<Option<u64>>,
     /// Write timeout in ms (`None` = block indefinitely). Honored by
-    /// [`KcpStream::write_all_shared`], `poll_write`, and [`KcpStream::writable`].
+    /// [`KcpStream::write_all`], `poll_write`, and [`KcpStream::writable`].
     pub(crate) write_timeout: Mutex<Option<u64>>,
     /// Mono-ms deadline for a blocked `poll_read` (checked on the next poll).
     pub(crate) read_deadline: Mutex<Option<u64>>,

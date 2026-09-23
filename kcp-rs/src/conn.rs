@@ -30,7 +30,9 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use parking_lot::Mutex;
 
-use crate::config::{KcpConfig, KcpMode};
+use crate::config::KcpConfig;
+#[cfg(test)]
+use crate::config::KcpMode;
 
 enum DialTransport {
     Udp,
@@ -110,7 +112,7 @@ mod halves;
 mod raw_queue;
 
 pub(crate) use endpoint::process_inbound_batch;
-pub use endpoint::SharedIoState;
+	pub(crate) use endpoint::SharedIoState;
 use endpoint::{spawn_flush_loop, spawn_input_loop};
 pub use halves::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, WriteHalf};
 #[cfg(test)]
@@ -298,15 +300,13 @@ impl KcpStream {
         Ok(self.shared.last_error.lock().take())
     }
 
-    /// Set the nonblocking mode. Like `std::net::TcpStream::set_nonblocking`,
-    /// but for KCP the effect is: when `true`, [`read`](Self::read) returns
-    /// [`io::ErrorKind::WouldBlock`] instead of parking on no data, and
-    /// [`write_all`](Self::write_all) returns `WouldBlock` when the send
-    /// window is full.
+    /// Set poll-style I/O. When `true`, [`read`](Self::read) returns
+    /// [`io::ErrorKind::WouldBlock`] instead of parking when nothing is
+    /// buffered, and [`write_all`](Self::write_all) returns `WouldBlock` when
+    /// the send window is full. `poll_read` / `poll_write` are unchanged:
+    /// they already return `Pending` rather than parking the task.
     ///
-    /// Default is `false` (blocking). KCP's async I/O loops always use the
-    /// blocking mode internally; setting `true` is for callers who want
-    /// poll-style semantics.
+    /// Default is `false` (park until data arrives or the window opens).
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         self.shared
             .nonblocking
@@ -406,7 +406,7 @@ impl KcpStream {
         Ok(())
     }
 
-    /// Set the read timeout. [`read_shared`](Self::read_shared), `poll_read`,
+    /// Set the read timeout. [`read`](Self::read), `poll_read`,
     /// and [`readable`](Self::readable) return [`io::ErrorKind::TimedOut`] after
     /// it elapses with no data. `None` disables.
     pub fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
@@ -419,7 +419,7 @@ impl KcpStream {
         Ok(self.shared.read_timeout.lock().map(Duration::from_millis))
     }
 
-    /// Set the write timeout. [`write_all_shared`](Self::write_all_shared) and
+    /// Set the write timeout. [`write_all`](Self::write_all) and
     /// `poll_write` return [`io::ErrorKind::TimedOut`] after it elapses while
     /// blocked on a full send window. `None` disables.
     pub fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
@@ -687,11 +687,6 @@ impl KcpStream {
         self.shared.peer_restart.load(Ordering::Relaxed)
     }
 
-    /// The peer address this connection talks to.
-    pub fn peer_addr(&self) -> SocketAddr {
-        self.shared.remote_addr
-    }
-
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.shared.transport.local_addr()
     }
@@ -759,7 +754,7 @@ impl KcpStream {
     /// This is the server-side entry point for the sharded worker's **serial
     /// pipeline**: recv → decrypt → KCP input → KCP flush → encrypt → send,
     /// all on the worker's thread with zero async scheduling overhead.
-    pub fn feed_raw_batch(&self, datagrams: Vec<Vec<u8>>) -> io::Result<()> {
+    pub(crate) fn feed_raw_batch(&self, datagrams: Vec<Vec<u8>>) -> io::Result<()> {
         if self.shared.is_closed() {
             return Ok(());
         }
@@ -791,7 +786,7 @@ impl KcpStream {
     /// Feed a single **raw (still-encrypted)** datagram — single-packet fast
     /// path that avoids allocating a `Vec<Vec<u8>>` wrapper. Used by the
     /// sharded worker's single-peer fast path.
-    pub fn feed_raw_single(&self, mut datagram: Vec<u8>) -> io::Result<()> {
+    pub(crate) fn feed_raw_single(&self, mut datagram: Vec<u8>) -> io::Result<()> {
         if self.shared.is_closed() {
             return Ok(());
         }
@@ -807,44 +802,9 @@ impl KcpStream {
         self.feed_single(datagram)
     }
 
-    /// **Worker-driven flush** — called by the sharded worker's event loop
-    /// (§14 `flush_ready_sessions`) when `background_input(false)` and no
-    /// async flush loop is spawned.
-    ///
-    /// **Worker-driven KCP maintenance** — called by the sharded worker's
-    /// event loop (`flush_ready_sessions`) to run the KCP state machine
-    /// (`flush_with_current`) for timely retransmission / delayed-ACK /
-    /// window probes. The actual wire-packet send is handled by the
-    /// per-connection flush loop's async path (or `feed_batch`'s inline
-    /// `drain_and_flush_tx` on the fast path).
-    ///
-    /// Returns `true` if the connection is still alive (caller should keep
-    /// it in the session map), `false` if closed.
-    pub fn tick(&self) -> bool {
-        if self.shared.is_closed() {
-            return false;
-        }
-
-        // ── KCP state-machine phase ──
-        let ws = {
-            let mut kcp = self.shared.kcp.lock();
-            let current = kcp.current_ms() as u32;
-            kcp.flush_with_current(current, true) as usize
-        };
-
-        self.shared.wait_send.store(ws, Ordering::Relaxed);
-        if ws < self.shared.snd_wnd.load(Ordering::Relaxed) {
-            self.shared.wake_writer();
-        }
-
-        // ── Drain + send produced packets (sync fast path) ──
-        let _ = self.shared.drain_and_flush_tx();
-        true
-    }
-
     /// Feed a single decrypted datagram — avoids `Vec<Vec<u8>>` allocation
     /// for the single-packet fast path.
-    pub fn feed_single(&self, datagram: Vec<u8>) -> io::Result<()> {
+    pub(crate) fn feed_single(&self, datagram: Vec<u8>) -> io::Result<()> {
         if self.shared.is_closed() {
             crate::sharded::recycle_buf(datagram);
             return Ok(());
@@ -863,7 +823,7 @@ impl KcpStream {
         Ok(())
     }
 
-    pub fn feed_batch(&self, datagrams: Vec<Vec<u8>>) -> io::Result<()> {
+    pub(crate) fn feed_batch(&self, datagrams: Vec<Vec<u8>>) -> io::Result<()> {
         if self.shared.is_closed() {
             for d in datagrams {
                 crate::sharded::recycle_buf(d);
@@ -919,6 +879,12 @@ impl KcpStream {
             }
             if self.shared.is_closed() || self.shared.read_closed.load(Ordering::Acquire) {
                 return Ok(0);
+            }
+            if self.shared.nonblocking.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "no buffered data to read",
+                ));
             }
             // A configured read timeout takes precedence. With no timeout,
             // wait on the permit-storing Notify indefinitely; a periodic
@@ -1000,6 +966,14 @@ impl KcpStream {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "KcpStream closed",
+                ));
+            }
+            if self.shared.nonblocking.load(Ordering::Acquire)
+                && !self.shared.backpressure_relieved()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "send window full",
                 ));
             }
             // Inline send + flush under the KCP lock; NO await while the guard
@@ -1135,7 +1109,7 @@ macro_rules! kcp_config_setters {
             self
         }
 
-        pub fn mode(mut self, value: KcpMode) -> Self {
+        pub fn mode(mut self, value: crate::KcpMode) -> Self {
             self.config.mode = value;
             self
         }
@@ -1160,8 +1134,17 @@ macro_rules! kcp_config_setters {
             self
         }
 
-        pub fn nodelay(mut self, nodelay: u32, interval: u32, resend: u32, nc: u32) -> Self {
-            self.config.mode = KcpMode::Manual;
+        /// Raw KCP latency knobs `(nodelay, interval, resend, nc)`, switching
+        /// the mode to [`KcpMode::Manual`]. Named apart from
+        /// [`KcpStream::set_nodelay`], which is the bool fast-path toggle.
+        pub fn set_kcp_nodelay(
+            mut self,
+            nodelay: u32,
+            interval: u32,
+            resend: u32,
+            nc: u32,
+        ) -> Self {
+            self.config.mode = crate::KcpMode::Manual;
             self.config.nodelay = nodelay;
             self.config.interval = interval;
             self.config.resend = resend;
@@ -1223,7 +1206,7 @@ impl KcpStreamBuilder {
     /// Spawn the background input-loop task (default `true`).
     ///
     /// Set to `false` when an external driver feeds inbound via
-    /// [`KcpStream::feed_input`] (the Acceptor + Worker sharding prototype), so
+    /// [`KcpStream::feed_raw_batch`] (the listener worker pipeline), so
     /// the connection's tasks stay on the driver's runtime instead of being
     /// scheduled onto the process-wide executor.
     pub fn background_input(mut self, enabled: bool) -> Self {
@@ -1233,10 +1216,10 @@ impl KcpStreamBuilder {
 
     /// Whether `build()` should spawn the async flush loop (default `true`).
     ///
-    /// Server-side sharded workers set this to `false` and call
-    /// [`KcpStream::tick()`] from the worker event loop instead. Client-side
-    /// connections also set this to `false` — `poll_read`/`poll_write` call
-    /// `tick()` inline, so no background task is needed.
+    /// Default `true`, which is what both clients and the listener workers use:
+    /// the loop runs retransmit / delayed-ACK / window-probe deadlines and is
+    /// woken by `flush_notify`. Set to `false` only for a caller that drives
+    /// those deadlines itself (the in-crate unit tests do).
     pub fn spawn_flush_loop(mut self, enabled: bool) -> Self {
         self.spawn_flush_loop = enabled;
         self

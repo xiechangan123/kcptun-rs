@@ -19,17 +19,17 @@ Async surface (optional): `KcpStream` is a tokio-TCP-shaped `AsyncRead`/`AsyncWr
 | `src/segment.rs` | 24-byte LE wire header, `Command` enum, `SegmentPool` (SegQueue) |
 | `src/fec.rs` | `FecEncoder` / `FecDecoder` / `fec_expand_packets` / `fec_kcp_from_recovered`; header types `0x00f1` / `0x00f2` / `0x00f3` |
 | ~~`src/crypto_buf.rs`~~ | **Removed** (B2) — moved to `kcrypt-rs::wire`; see `../kcrypt-rs/AGENTS.md` |
-| `src/conn.rs` | (feature `async`) `KcpStream` + `SharedIoState` + builder + background loops + poll impls + split halves; exposes monotonic `last_activity_ms` for upper-layer session expiry; **TcpStream-aligned surface** (`set_nodelay(bool)`, `shutdown(Shutdown)`, read/write timeouts, `split`/`into_split`, `readable`/`writable`, `peek`, `take_error`, builder `.connect_timeout`) + KCP tuning prefixed `set_kcp_*`; shared builder setters use one internal macro (re-exported for listener builders). TX path uses `flush_tx_batch` (non-blocking `sendmmsg` fast path → async `send_batch` fallback on `WouldBlock`, pipeline §15–§16); `feed_batch` (external worker path, `background_input=false`) does inline sync drain-and-flush via `drain_and_flush_tx` before falling back to `flush_notify` (pipeline §14) |
+| `src/conn.rs` | (feature `async`) `KcpStream` + `SharedIoState` (crate-private) + builder + background loops + poll impls + split halves; exposes monotonic `last_activity_ms` for upper-layer session expiry; **TcpStream-aligned surface** (`set_nodelay(bool)`, `set_nonblocking(bool)` honored by `read`/`write_all`, `shutdown(Shutdown)`, read/write timeouts, `split`/`into_split`, `readable`/`writable`, `peek`, `take_error`, builder `.connect_timeout`) + post-construction `set_kcp_window_size`; builder raw knobs are `.set_kcp_nodelay(n,i,r,nc)` (not `.nodelay`). Shared builder setters use one internal macro (re-exported for both listener builders). TX path uses `flush_tx_batch` (non-blocking `sendmmsg` fast path → async `send_batch` fallback on `WouldBlock`); `feed_raw_batch`/`feed_batch`/`tick` are `pub(crate)` — the listener worker path only |
 | `src/transport.rs` | (feature `async`) `PacketTransport` trait + impls (`knet::DatagramSocket`, per-peer `PeerTransport`) + `PeerQueue` (listener demux) + `TransportWrapper`; `MAX_DATAGRAM`/`MAX_RETAINED_PEER_BUFFERS` consts |
-| `src/listener.rs` | (feature `async`) `KcpListener` (shared-UDP demux) + `KcpTcpListener` (raw TCP) + builders + `spawn_listener_reader`; **TcpListener-aligned surface** (`accept_timeout`, `try_accept` [KcpListener only], `take_error`, builders are `IntoFuture` so `bind(addr).await` works); depends on `conn` + `transport` |
-| `src/sharded.rs` | (feature `async`) `ShardedKcpListener` + `ShardedKcpListenerBuilder` — sharded worker pipeline architecture: RX reader → bounded channel → N worker tasks with session affinity (`fast_hash_peer % worker_count`); workers build `KcpStream` with `background_input(false)` and feed inbound via `feed_batch` (§10.2 Mode B: decrypt + KCP + encrypt all on the same worker); public entry points `bind_listener(addr)` / `from_socket_listener(sock)` |
+| `src/listener.rs` | (feature `async`) `KcpTcpListener` only — a Linux raw-TCP **transport factory** (one accepted TCP conn → one `KcpStream`), NOT a demux listener. Builder shares the config setters and is `IntoFuture`. The UDP demux listener lives in `sharded.rs` |
+| `src/sharded.rs` | (feature `async`) `KcpListener` + `KcpListenerBuilder` — the UDP demux listener, three topologies (direct single worker / Linux SO_REUSEPORT group / reader pipeline). Workers build `KcpStream` with `background_input(false)` and feed inbound via `feed_raw_batch` (decrypt + KCP + encrypt on the worker thread). Public entry points `KcpListener::bind` / `from_socket` (also `bind_listener` / `from_socket_listener`) |
 | `src/config.rs` | **Always-on** `KcpConfig` / `KcpMode`; `KCP::apply` / `set_mode` (B1) |
 | `src/snmp.rs` | Global `DEFAULT_SNMP` atomic counters; `snmp_enable` / `snmp_add` / `snmp_store` |
 | `README.md` | User-facing usage guide: sync + async API, wire format, config, testing |
 | `test.sh` | Standalone test runner: sync (default) + `async` |
 | `tests/data_correctness.rs` | Sync reliability + FEC data-correctness over in-memory flaky channel |
-| `tests/kcpconn_integrity.rs` | Async `KcpStream` integrity over localhost UDP |
-| `tests/kcpconn_listener.rs` | Server listen / client connect: accept echo, multi-peer demux, serve-after-close |
+| `tests/kcpstream_integrity.rs` | Async `KcpStream` integrity over localhost UDP |
+| `tests/kcpstream_listener.rs` | Server listen / client connect: accept echo, multi-peer demux, serve-after-close |
 
 ## Features
 
@@ -55,12 +55,13 @@ let conn = KcpStream::with_transport(transport, cfg).await?;
 ```
 
 - **TcpStream-aligned surface** (learn-cost ≈ `tokio::net::TcpStream`):
-  `set_nodelay(bool)`/`nodelay()`, `set_read_timeout`/`set_write_timeout` (+ getters),
+  `set_nodelay(bool)`/`nodelay()`, `set_nonblocking(bool)` (honored by `read`/`write_all`),
+  `set_read_timeout`/`set_write_timeout` (+ getters),
   `shutdown(std::net::Shutdown)` half-close, `peek()`, `take_error()`,
   `split()`/`into_split()` (owned halves close the connection on last-half drop),
-  `readable()`/`writable()`. KCP-specific tuning is prefixed **`set_kcp_*`**
-  (`set_kcp_nodelay(n,i,r,nc)`, `set_kcp_window_size`, `set_kcp_mtu`,
-  `set_kcp_stream_mode`, `set_kcp_acknodelay`) so the plain `set_*` names stay free.
+  `readable()`/`writable()`. Post-construction KCP tuning is `set_kcp_window_size`;
+  the raw knobs are builder-only via `.set_kcp_nodelay(n,i,r,nc)` so they don't
+  collide with the bool `set_nodelay`. MTU / stream mode / acknodelay stay on the builder.
 - `poll_shutdown`/`poll_close` = **write-half close** (tokio semantics), NOT full
   close — the production stack calls `KcpStream::close()` explicitly. KCP has **no wire
   FIN**, so peer-aware half-close lives at the SMUX/session layer.
@@ -105,8 +106,8 @@ let conn = KcpStream::with_transport(transport, cfg).await?;
 
 - Standalone runner: `bash kcp-rs/test.sh` (sync default → `async`)
 - Sync data-correctness: `cargo test -p kcp-rs --test data_correctness`
-- Async integrity: `cargo test -p kcp-rs --features async --test kcpconn_integrity`
-- Listener / connect: `cargo test -p kcp-rs --features async --test kcpconn_listener`
+- Async integrity: `cargo test -p kcp-rs --features async --test kcpstream_integrity`
+- Listener / connect: `cargo test -p kcp-rs --features async --test kcpstream_listener`
 - In-module unit tests where present
 - Async: `cargo test -p kcp-rs --features async`
 - Interop: `bash test_e2e.sh` after segment/KCP/FEC changes

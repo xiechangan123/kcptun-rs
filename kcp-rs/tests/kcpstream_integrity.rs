@@ -467,6 +467,23 @@ fn kcpstream_tcp_stream_surface() {
         assert_eq!(&got, b"hello");
 
         conn_a.close();
+
+        // set_nonblocking is honored by the &self read/write, not only stored.
+        let (conn_c, _conn_d) = pair_conns(None).await;
+        conn_c.set_nonblocking(true).unwrap();
+        let mut empty = [0u8; 4];
+        let err = conn_c.read(&mut empty).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        // Fill the send window (sndwnd 128 × ~1.3 KB MSS) so the next write blocks.
+        let chunk = vec![0xA5u8; 64 * 1024];
+        loop {
+            match conn_c.write_all(&chunk).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("unexpected write error: {e}"),
+            }
+        }
+        conn_c.close();
         conn_b.close();
     });
 }
