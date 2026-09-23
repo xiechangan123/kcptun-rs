@@ -20,12 +20,12 @@ pub mod task;
 pub mod time;
 
 // ─── Convenience re-exports ────────────────────────────────────────────────────
+pub use net::sockbuf::{set_socket_buffers, SocketBuffers};
 #[cfg(unix)]
 pub use net::UnixListener;
 pub use net::{tcpraw_dial, tcpraw_listen};
 pub use net::{DatagramSocket, TcpListener, TcpStream, UdpSocket};
 pub use net::{TcpRawConn, TcpRawListener};
-pub use net::sockbuf::{set_socket_buffers, SocketBuffers};
 pub use sync::cancel::{race, CancellationToken, Cancelled, Race, RaceOutcome};
 pub use sync::Notify;
 pub use task::{

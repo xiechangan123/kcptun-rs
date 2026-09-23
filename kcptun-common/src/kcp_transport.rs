@@ -207,7 +207,13 @@ impl CryptoTransport {
             match knet::timeout(
                 ENCRYPT_CPU_BLOCK_WAIT,
                 knet::cpu_block(move || {
-                    encrypt_batch(job_packets, job_crypt.as_ref(), &job_cb, has_encryption, false)
+                    encrypt_batch(
+                        job_packets,
+                        job_crypt.as_ref(),
+                        &job_cb,
+                        has_encryption,
+                        false,
+                    )
                 }),
             )
             .await

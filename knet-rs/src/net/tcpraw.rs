@@ -721,8 +721,9 @@ impl TcpRawListener {
                                     break;
                                 }
                             }
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock
-                                || e.kind() == io::ErrorKind::Interrupted =>
+                            Err(e)
+                                if e.kind() == io::ErrorKind::WouldBlock
+                                    || e.kind() == io::ErrorKind::Interrupted =>
                             {
                                 match close_rx.try_recv() {
                                     Err(async_channel::TryRecvError::Empty) => {
@@ -764,11 +765,10 @@ impl TcpRawListener {
     pub async fn accept(&self) -> io::Result<(TcpRawConn, SocketAddr)> {
         // The blocking wait lives on the dedicated accept thread (see `bind`);
         // this await only receives an already-accepted connection.
-        let (stream, peer_addr) = self
-            .conn_rx
-            .recv()
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::NotConnected, "tcpraw listener closed"))??;
+        let (stream, peer_addr) =
+            self.conn_rx.recv().await.map_err(|_| {
+                io::Error::new(io::ErrorKind::NotConnected, "tcpraw listener closed")
+            })??;
         let _ = stream.set_nonblocking(true);
 
         let local = stream.local_addr()?;
@@ -1585,7 +1585,8 @@ mod integration_tests {
             return;
         }
         crate::block_on(async {
-            let server = Arc::new(TcpRawListener::bind(&SocketAddr::from(([127, 0, 0, 1], 0))).unwrap());
+            let server =
+                Arc::new(TcpRawListener::bind(&SocketAddr::from(([127, 0, 0, 1], 0))).unwrap());
             // Occupy the whole blocking pool (one job per worker) with parked
             // accepts; spawn one extra for slack. Each spawned task polls its
             // future, which is what used to submit the blocking accept job.
