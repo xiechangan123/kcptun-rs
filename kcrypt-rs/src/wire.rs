@@ -177,10 +177,17 @@ impl CryptoBuf {
     #[inline]
     pub fn encrypt_cfb(&mut self, data: &[u8], crypt: &CryptEngine) -> Bytes {
         let total = CRYPTO_HEADER_SIZE + data.len();
-        // Keep spare so full-length split_to does not empty the reusable allocation.
-        const SPARE: usize = 2048;
+        // Grow only when the remaining tail can't hold this packet. `split_to`
+        // hands out the packet and leaves the tail for the next one, so a
+        // large target amortizes mallocs across several packets.
+        //
+        // (bytes ≥1.12 `BytesMut::copy_to_bytes` is just `split_to().freeze()`;
+        // the old per-packet malloc came from `reserve(total + SPARE)` after
+        // `split_to` left only `SPARE` behind.)
         self.enc_buf.clear();
-        self.enc_buf.reserve(total + SPARE);
+        if self.enc_buf.capacity() < total {
+            self.enc_buf.reserve(total.saturating_mul(8).max(16384));
+        }
 
         // Build via extend (one O(n) write) — avoid resize(total, 0) zero-fill
         // that would immediately be overwritten.
@@ -192,11 +199,43 @@ impl CryptoBuf {
 
         crypt.encrypt(&mut self.enc_buf[..total]);
 
-        // copy_to_bytes preserves enc_buf's allocation; split_to moved it
-        // out and forced the reserve below to malloc a new buffer per
-        // packet. In the batch path this is one malloc per packet.
-        use bytes::Buf;
-        self.enc_buf.copy_to_bytes(total)
+        // split_to keeps the tail capacity on enc_buf; the returned Bytes only
+        // holds [0, total) of the slab. Subsequent writes go into the tail and
+        // never alias the frozen prefix.
+        self.enc_buf.split_to(total).freeze()
+    }
+
+    /// Encrypt a batch of CFB packets into one reusable slab.
+    ///
+    /// One allocation for the whole batch: each packet is a `split_to` slice
+    /// sharing the same backing store. Use this instead of looping
+    /// [`Self::encrypt_cfb`] so a flush does not malloc per datagram.
+    pub fn encrypt_cfb_batch(
+        &mut self,
+        packets: &[Bytes],
+        crypt: &CryptEngine,
+        out: &mut Vec<Bytes>,
+    ) {
+        const MIN_TAIL: usize = 4096;
+        let total_wire: usize = packets
+            .iter()
+            .map(|p| CRYPTO_HEADER_SIZE + p.len())
+            .sum();
+        self.enc_buf.clear();
+        let needed = total_wire.saturating_add(MIN_TAIL);
+        if self.enc_buf.capacity() < needed {
+            self.enc_buf.reserve(needed);
+        }
+        for data in packets {
+            let total = CRYPTO_HEADER_SIZE + data.len();
+            self.enc_buf.extend_from_slice(&self.nonce.next());
+            let crc = crc32fast::hash(data);
+            self.enc_buf.extend_from_slice(&crc.to_le_bytes());
+            self.enc_buf.extend_from_slice(data);
+            debug_assert_eq!(self.enc_buf.len(), total);
+            crypt.encrypt(&mut self.enc_buf[..total]);
+            out.push(self.enc_buf.split_to(total).freeze());
+        }
     }
 
     /// Encrypt one packet with the standard 20B CFB wire format.
@@ -230,10 +269,12 @@ impl CryptoBuf {
     #[inline]
     pub fn prepare_encrypt(&mut self, data: &[u8]) -> BytesMut {
         let total = CRYPTO_HEADER_SIZE + data.len();
-        // Keep spare so full-length split_to does not empty the reusable allocation.
-        const SPARE: usize = 2048;
+        // Same amortized grow as `encrypt_cfb`: only when the tail can't hold
+        // this packet. `split_to` leaves the tail on `enc_buf`.
         self.enc_buf.clear();
-        self.enc_buf.reserve(total + SPARE);
+        if self.enc_buf.capacity() < total {
+            self.enc_buf.reserve(total.saturating_mul(8).max(16384));
+        }
 
         let n = self.nonce.next();
         self.enc_buf.extend_from_slice(&n);
@@ -242,11 +283,7 @@ impl CryptoBuf {
         self.enc_buf.extend_from_slice(data);
         debug_assert_eq!(self.enc_buf.len(), total);
 
-        let prepared = self.enc_buf.split_to(total);
-        if self.enc_buf.capacity() < SPARE {
-            self.enc_buf.reserve(SPARE);
-        }
-        prepared
+        self.enc_buf.split_to(total)
     }
 
     /// Fill CRC32 of the plaintext payload then encrypt in place.
@@ -277,7 +314,10 @@ impl CryptoBuf {
         let body = decrypt_cfb_in_place(data, crypt, false).ok()?;
         let payload_len = body.len();
         self.enc_buf.clear();
-        self.enc_buf.reserve(payload_len);
+        if self.enc_buf.capacity() < payload_len {
+            self.enc_buf
+                .reserve(payload_len.saturating_mul(8).max(16384));
+        }
         self.enc_buf.extend_from_slice(body);
         Some(self.enc_buf.split_to(payload_len).freeze())
     }
@@ -554,9 +594,7 @@ pub fn encrypt_batch_ref_into(
             should_parallel_cfb_encrypt(crypt, allow_parallel, packets.len(), total_bytes);
         if !use_parallel {
             let mut cb = crypto_buf.lock();
-            for data in packets {
-                out.push(cb.encrypt_cfb(data, crypt));
-            }
+            cb.encrypt_cfb_batch(packets, crypt, out);
         } else {
             // Cap workers: more than 4 threads rarely helps one session's encrypt
             // and increases join latency on high-core hosts.
@@ -642,6 +680,82 @@ mod tests {
         assert!(decrypted.is_some());
         let dec = decrypted.unwrap();
         assert_eq!(&dec[..], plaintext);
+    }
+
+    /// Regression: `copy_to_bytes` took the whole slab when `len == remaining()`,
+    /// so every packet dropped capacity and the next `reserve` malloc'd again.
+    #[test]
+    fn encrypt_cfb_retains_reusable_capacity() {
+        let (crypt, _) = CryptEngine::select("aes-128", b"test-key-12345678");
+        let mut cb = CryptoBuf::new(0xA110C);
+        let data = vec![0xABu8; 1200];
+        for i in 0..16 {
+            let pkt = cb.encrypt_cfb(&data, &crypt);
+            assert_eq!(pkt.len(), CRYPTO_HEADER_SIZE + data.len(), "pkt {i}");
+            assert!(
+                cb.enc_buf.capacity() > 0,
+                "encrypt_cfb dropped reusable capacity at pkt {i}"
+            );
+        }
+    }
+
+    /// Capacity must be amortized across same-size packets, not regrown
+    /// every call (the old `copy_to_bytes` bug did exactly that).
+    #[test]
+    fn encrypt_cfb_amortizes_allocation_across_packets() {
+        let (crypt, _) = CryptEngine::select("aes-128", b"test-key-12345678");
+        let mut cb = CryptoBuf::new(0xA110C);
+        let data = vec![0xABu8; 1200];
+        let _warm = cb.encrypt_cfb(&data, &crypt);
+        let mut grows = 0usize;
+        let mut last_cap = cb.enc_buf.capacity();
+        for _ in 0..32 {
+            let _pkt = cb.encrypt_cfb(&data, &crypt);
+            let cap = cb.enc_buf.capacity();
+            if cap > last_cap {
+                grows += 1;
+                last_cap = cap;
+            }
+        }
+        assert!(
+            grows < 16,
+            "capacity grew {grows}/32 packets — reserve is not amortized"
+        );
+    }
+
+    #[test]
+    fn encrypt_cfb_batch_is_wire_compatible_and_roundtrips() {
+        let (crypt, _) = CryptEngine::select("aes-128", b"test-key-12345678");
+        let mut cb = CryptoBuf::new(0xB47C4);
+        let packets: Vec<Bytes> = (0..8u8)
+            .map(|i| Bytes::from(vec![i.wrapping_mul(17); 300 + i as usize]))
+            .collect();
+
+        let mut out = Vec::new();
+        cb.encrypt_cfb_batch(&packets, &crypt, &mut out);
+        assert_eq!(out.len(), packets.len());
+        for (i, (wire, plain)) in out.iter().zip(&packets).enumerate() {
+            assert_eq!(wire.len(), CRYPTO_HEADER_SIZE + plain.len(), "pkt {i}");
+            let mut enc = wire.to_vec();
+            let dec = cb
+                .decrypt_cfb(&mut enc, &crypt)
+                .unwrap_or_else(|| panic!("decrypt failed at pkt {i}"));
+            assert_eq!(&dec[..], &plain[..], "pkt {i}");
+        }
+
+        // A second batch must reuse the slab (no per-packet regrow).
+        let mut grows = 0usize;
+        let mut last_cap = cb.enc_buf.capacity();
+        for _ in 0..16 {
+            out.clear();
+            cb.encrypt_cfb_batch(&packets, &crypt, &mut out);
+            let cap = cb.enc_buf.capacity();
+            if cap > last_cap {
+                grows += 1;
+                last_cap = cap;
+            }
+        }
+        assert!(grows < 8, "batch slab regrew {grows}/16 batches");
     }
 
     #[test]

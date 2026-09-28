@@ -613,6 +613,11 @@ fn spawn_rx(args: RxArgs) -> knet::JoinHandle<()> {
         let mut groups: Vec<(SocketAddr, Vec<Vec<u8>>)> = Vec::new();
         let mut group_index: HashMap<SocketAddr, usize> = HashMap::new();
         let mut last_sweep = Instant::now();
+        // recvmmsg scratch: one syscall fills up to RECV_MMSG_MAX slots.
+        // Slots move into `burst` and are replaced from the buffer pool.
+        const RECV_MMSG_MAX: usize = 64;
+        let mut recv_bufs: Vec<Vec<u8>> = Vec::with_capacity(RECV_MMSG_MAX);
+        let mut recv_peers: Vec<SocketAddr> = Vec::with_capacity(RECV_MMSG_MAX);
 
         loop {
             // `close()` does not end this task. An accepted session still needs
@@ -666,25 +671,62 @@ fn spawn_rx(args: RxArgs) -> knet::JoinHandle<()> {
             // per-datagram feeding makes every datagram a one-packet burst,
             // which both multiplies KCP locks and send syscalls and defeats
             // the whole-burst stale-session guard.
+            //
+            // Linux drains via `recvmmsg` (one syscall per ≤64 datagrams).
+            // `try_recv_batch_from_into` returns `Ok(0)` for TcpRaw (no batch
+            // path), so fall back to single `try_recv_from` to keep draining.
             while burst.len() < batch_cap {
-                let mut buf = acquire_buf().unwrap_or_else(|| Vec::with_capacity(MAX_DATAGRAM));
+                let want = (batch_cap - burst.len()).min(RECV_MMSG_MAX);
+                while recv_bufs.len() < want {
+                    let mut b = acquire_buf().unwrap_or_else(|| Vec::with_capacity(MAX_DATAGRAM));
+                    if b.capacity() < MAX_DATAGRAM {
+                        b.reserve(MAX_DATAGRAM - b.capacity());
+                    }
+                    recv_bufs.push(b);
+                }
+                let batch_n = match args
+                    .socket
+                    .try_recv_batch_from_into(&mut recv_bufs[..want], &mut recv_peers)
+                {
+                    Ok(n) => n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => 0,
+                    Err(e) => {
+                        *args.last_error.lock() = Some(e);
+                        knet::sleep_ms(10).await;
+                        break;
+                    }
+                };
+                if batch_n > 0 {
+                    for i in 0..batch_n.min(recv_peers.len()) {
+                        let buf = std::mem::take(&mut recv_bufs[i]);
+                        let peer = recv_peers[i];
+                        // `try_recv_batch_from_into` leaves len == payload.
+                        burst.push((peer, buf));
+                        recv_bufs[i] =
+                            acquire_buf().unwrap_or_else(|| Vec::with_capacity(MAX_DATAGRAM));
+                    }
+                    // Unparsed peers: don't leak the payload buffers.
+                    for item in recv_bufs.iter_mut().take(batch_n).skip(recv_peers.len()) {
+                        item.clear();
+                    }
+                    continue;
+                }
+                // Batch empty or unsupported (TcpRaw) — single-datagram drain.
+                let mut buf = std::mem::take(&mut recv_bufs[0]);
+                if buf.capacity() < MAX_DATAGRAM {
+                    buf.reserve(MAX_DATAGRAM - buf.capacity());
+                }
                 buf.resize(MAX_DATAGRAM, 0);
                 match args.socket.try_recv_from(&mut buf) {
                     Ok((n, peer)) if n > 0 => {
                         buf.truncate(n);
                         burst.push((peer, buf));
+                        recv_bufs[0] =
+                            acquire_buf().unwrap_or_else(|| Vec::with_capacity(MAX_DATAGRAM));
                     }
-                    Ok(_) => {
-                        recycle_buf(buf);
-                        break;
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        recycle_buf(buf);
-                        break;
-                    }
-                    Err(e) => {
-                        *args.last_error.lock() = Some(e);
-                        recycle_buf(buf);
+                    _ => {
+                        buf.clear();
+                        recv_bufs[0] = buf;
                         break;
                     }
                 }

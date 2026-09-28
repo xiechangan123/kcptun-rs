@@ -934,6 +934,9 @@ impl KCP {
             {
                 let data = self.buffer.copy_to_bytes(self.buffer.len());
                 (self.output)(data);
+                if self.buffer.capacity() < mtu {
+                    self.buffer.reserve(mtu);
+                }
             }
             self.ack_seg.sn = sn;
             self.ack_seg.ts = ts;
@@ -1140,18 +1143,20 @@ impl KCP {
 
         let mtu = self.mtu as usize;
 
-        // Helper: flush the output buffer and return remaining capacity.
+        // Helper: flush the output buffer and keep a datagram-sized capacity.
         //
-        // `split().freeze()` moved the allocation out and forced `reserve(mtu)`
-        // to malloc a new buffer every time — one malloc per output packet.
-        // `copy_to_bytes` copies the data into a new `Bytes` and clears the
-        // buffer, leaving its existing allocation intact for the next packet
-        // encode. The copy is cheap (a single memcpy of ≤ mtu bytes, already
-        // about to be encrypted/written) compared to the malloc it replaces.
+        // `BytesMut::copy_to_bytes(len)` is `split_to(len).freeze()` (bytes 1.12):
+        // the tail capacity stays on `buf`, but when the buffer was full that
+        // tail is ~0 and the next `Segment::encode` would grow field-by-field.
+        // Re-reserve `mtu` after each flush so encoding stays allocation-free
+        // in the steady state.
         let flush_buf = |buf: &mut BytesMut, output: &mut Box<dyn FnMut(Bytes) + Send>| {
             if !buf.is_empty() {
                 let data = buf.copy_to_bytes(buf.len());
                 output(data);
+            }
+            if buf.capacity() < mtu {
+                buf.reserve(mtu);
             }
         };
 

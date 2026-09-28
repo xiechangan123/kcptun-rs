@@ -372,3 +372,76 @@ A later rollback-control run at the same 8-P / 64-connection shape completed at
 accepted regression or gain. The next architectural gate for a pure stackful
 M:N design is a context backend whose suspended state and scheduler hand-off
 are explicitly cross-M safe; do not migrate the current corosensei fibers.
+
+## ✅ 2026-09-28: CryptoBuf wire-buffer reuse (`copy_to_bytes` dropped capacity every packet)
+
+Workload: `target/profiling` server+client, AES-128 CFB, `--nocomp --mode fast`,
+16 TCP connections × 4 MiB echo, 20 s CPU profile on macOS arm64. Capture:
+`bench/profiles/goal-load-20260928-102646/` (before) and
+`bench/profiles/goal-load-after2-20260928-104218/` (after). Same load shape
+both runs; port 6060 was occupied by an unrelated process on the after-run so
+pprof was temporarily bound to 127.0.0.1:16060 (reverted).
+
+`CryptoBuf::encrypt_cfb` / `AesGcm::seal_into` / `prepare_encrypt` always did
+`reserve(total + SPARE)` after `clear()`, then `split_to(total)`. `split_to`
+leaves only `SPARE` (2 KiB) of tail, so the next `reserve(total + SPARE)` saw
+`capacity < total + SPARE` and **malloc'd a fresh buffer every datagram**.
+(bytes ≥1.12 `BytesMut::copy_to_bytes` is just `split_to().freeze()` — the
+malloc came from the reserve, not from a copy.) pprof attributed essentially
+all of `encrypt_cfb` cum (11.7%) to `BytesMut::reserve` on that line.
+
+Fix (kcrypt-rs, wire format unchanged):
+- `encrypt_cfb` / `seal_into` / `decrypt_cfb`: `split_to(n).freeze()` keeps the
+  tail capacity on the reusable buffer; reserve is amortized (`max(needed, 4×packet)`).
+- new `CryptoBuf::encrypt_cfb_batch`: one slab per flush, each wire packet a
+  `split_to` slice; used by `encrypt_batch_ref_into`'s serial CFB path.
+
+16-conn AES CPU samples (20 s wall):
+
+| Frame | Before | After |
+|-------|--------|-------|
+| Total samples (CPU s) | 30.49 (152%) | **21.56 (108%)** |
+| `UdpSocket::send_to` | 14.70 s | 10.65 s |
+| `BytesMut::reserve` | 2.58 s (8.5%) | **0.30 s (1.4%)** |
+| `mi_arenas_try_find_free` | 2.48 s (8.2%) | **0.37 s (1.7%)** |
+| `_mi_theap_malloc_zero_ex` cum | 2.89 s | **0.76 s** |
+| `encrypt_cfb` / `encrypt_cfb_batch` cum | 3.58 s | 1.30 s |
+| `reed_solomon::code_single_slice` | 1.34 s | 1.05 s |
+
+≈29% less CPU for the same 16-conn echo workload. Remaining hotspots are
+syscall-bound: `send_to` ≈ 50% (macOS has no `sendmmsg`; Linux path already
+batches), `try_recv_from` ≈ 14%, then FEC RS ≈ 5% and AES encrypt ≈ 5%.
+Default FEC 10:3 still expands the wire batch by 30% — a config lever
+(`--datashard/--parityshard`), not a code path.
+
+Regression tests: `encrypt_cfb_retains_reusable_capacity`,
+`encrypt_cfb_batch_is_wire_compatible_and_roundtrips` (kcrypt-rs wire tests).
+
+## 🔄 2026-09-28 (Linux 192.168.0.18): remaining hotspots after buffer + recvmmsg
+
+Host: 4× Xeon E-2314, kernel 3.10, musl profiling bins (frame pointers + pprof),
+AES-128 CFB (32-byte PBKDF2 key → AES-256, matching Go), `--nocomp`, 16 conn × 4 MiB.
+Artifacts: `/tmp/kcpbench-cmp/prof/run-120143` (pre-recvmmsg), `run-mmsg-121204` (post).
+
+| Frame | Before recvmmsg | After |
+|-------|-----------------|-------|
+| `Aes256::encrypt_with_backend` | 11.8% | 11.8% |
+| `reed_solomon::code_single_slice` | 7.9% | 8.4% |
+| UDP recv | `recv_from` 6.0% | `recvmmsg_from_into` 6.7% |
+| `sendmmsg_to` | ~0.1% | ~0% |
+| FEC total (`fec_expand` + `encode` + decode) | ~13–15% | ~13–15% |
+| `encrypt_cfb_batch` cum | 17.3% | 18.9% |
+
+Findings:
+- **sendmmsg already works on Linux** — the macOS `send_to` hotspot does not exist here.
+- **RX was still per-datagram `try_recv_from`** despite `knet` exposing `recvmmsg`.
+  `spawn_rx`'s drain loop now calls `try_recv_batch_from_into` (≤64/recvmmsg).
+  Remaining recv cost is kernel datagram copy, not syscall count.
+- AES is already AES-NI (`autodetect`); 32-byte key ⇒ AES-256 is wire-compatible with Go.
+- FEC (default 10:3) is the largest non-crypto block (~13–15% CPU + 30% extra datagrams).
+  One-shot 16-conn 32 MiB A/B on this box: 10:3 = 92.0 MB/s, 20:3 = 94.3 MB/s,
+  off = 77.1 MB/s (single runs, loopback, noise-level — not a reason to disable FEC).
+
+What is left inside the current structure is mostly inherent: CFB AES (serial per packet),
+FEC RS arithmetic, and payload copies. Further gains need fewer datagrams (FEC policy /
+MTU) rather than more scheduling work.

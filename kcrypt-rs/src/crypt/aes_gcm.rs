@@ -67,11 +67,13 @@ impl AeadCrypt for Aes128GcmCrypt {
 
     fn seal_into(&self, plaintext: &[u8], out: &mut BytesMut) -> Bytes {
         let total = NONCE_SZ + plaintext.len() + TAG_SZ;
-        // Keep spare capacity so split_to(total) does not empty the allocation
-        // (BytesMut moves capacity with a full-length split).
-        const SPARE: usize = 2048;
+        // Grow only when the tail can't hold this packet; `split_to` leaves the
+        // tail for the next call (the old `reserve(total + SPARE)` regrew every
+        // packet because `split_to` left only `SPARE` behind).
         out.clear();
-        out.reserve(total + SPARE);
+        if out.capacity() < total {
+            out.reserve(total.saturating_mul(8).max(16384));
+        }
         // Build [nonce | plaintext | tag_placeholder] via extend — avoids the
         // full-buffer zero-fill that `resize(total, 0)` + `copy_from_slice`
         // would do (two O(n) passes → one O(n) + one O(TAG_SZ)).
@@ -88,8 +90,7 @@ impl AeadCrypt for Aes128GcmCrypt {
             .encrypt_in_place_detached(nonce, b"", &mut out[pt_start..pt_end])
             .expect("AES-GCM encrypt should not fail");
         out[pt_end..].copy_from_slice(tag.as_slice());
-        use bytes::Buf;
-        out.copy_to_bytes(total)
+        out.split_to(total).freeze()
     }
 
     fn open(&self, data: &[u8]) -> Result<Vec<u8>, String> {
