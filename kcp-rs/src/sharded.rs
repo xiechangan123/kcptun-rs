@@ -165,6 +165,9 @@ pub struct WorkerPoolStats {
     /// Datagrams from an unknown peer that failed the pre-admission integrity
     /// check, so no session was created (spoofed or stray traffic).
     pub unauthenticated_drops: u64,
+    /// Datagrams dropped because the source address could not be parsed out of
+    /// the receive batch (they cannot be routed to a session).
+    pub bad_addr_drops: u64,
     /// Sessions closed and removed by the idle reaper.
     pub idle_reaps: u64,
 }
@@ -176,6 +179,7 @@ struct ListenerStats {
     session_drops: AtomicU64,
     build_failures: AtomicU64,
     unauthenticated_drops: AtomicU64,
+    bad_addr_drops: AtomicU64,
     idle_reaps: AtomicU64,
 }
 
@@ -405,6 +409,7 @@ impl KcpListener {
             session_drops: self.stats.session_drops.load(Ordering::Relaxed),
             build_failures: self.stats.build_failures.load(Ordering::Relaxed),
             unauthenticated_drops: self.stats.unauthenticated_drops.load(Ordering::Relaxed),
+            bad_addr_drops: self.stats.bad_addr_drops.load(Ordering::Relaxed),
             idle_reaps: self.stats.idle_reaps.load(Ordering::Relaxed),
         }
     }
@@ -697,7 +702,8 @@ fn spawn_rx(args: RxArgs) -> knet::JoinHandle<()> {
                     }
                 };
                 if batch_n > 0 {
-                    for i in 0..batch_n.min(recv_peers.len()) {
+                    let parsed = batch_n.min(recv_peers.len());
+                    for i in 0..parsed {
                         let buf = std::mem::take(&mut recv_bufs[i]);
                         let peer = recv_peers[i];
                         // `try_recv_batch_from_into` leaves len == payload.
@@ -705,9 +711,20 @@ fn spawn_rx(args: RxArgs) -> knet::JoinHandle<()> {
                         recv_bufs[i] =
                             acquire_buf().unwrap_or_else(|| Vec::with_capacity(MAX_DATAGRAM));
                     }
-                    // Unparsed peers: don't leak the payload buffers.
-                    for item in recv_bufs.iter_mut().take(batch_n).skip(recv_peers.len()) {
-                        item.clear();
+                    // Source address missing/unparseable: cannot route.
+                    let bad = batch_n - parsed;
+                    if bad > 0 {
+                        args.stats
+                            .bad_addr_drops
+                            .fetch_add(bad as u64, Ordering::Relaxed);
+                        for item in recv_bufs.iter_mut().take(batch_n).skip(parsed) {
+                            item.clear();
+                        }
+                        // Progress requires a routable peer. A batch that
+                        // yielded none would spin forever dropping datagrams.
+                        if parsed == 0 {
+                            break;
+                        }
                     }
                     continue;
                 }
@@ -826,9 +843,7 @@ fn deliver_group(
             // batch is the stale-session guard's unit: a group counts as a
             // previous generation only when every datagram in it mismatched.
             let before = conn.stale_burst_count();
-            if conn.feed_raw_batch(datagrams).is_err() {
-                args.stats.channel_drops.fetch_add(1, Ordering::Relaxed);
-            }
+            conn.feed_raw_batch(datagrams);
             watched.push((peer, before));
             return;
         }

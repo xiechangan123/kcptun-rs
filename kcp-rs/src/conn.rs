@@ -729,7 +729,7 @@ impl KcpStream {
     /// established session is not woken through its queue; the burst shares
     /// one KCP lock, one flush and one send, and is the stale-session guard's
     /// unit (eviction requires every datagram of the burst to mismatch).
-    pub(crate) fn feed_raw_batch(&self, datagrams: Vec<Vec<u8>>) -> io::Result<()> {
+    pub(crate) fn feed_raw_batch(&self, datagrams: Vec<Vec<u8>>) {
         self.shared.feed_raw_batch(datagrams)
     }
 
@@ -1897,9 +1897,7 @@ mod integ {
         let stale_ack = header(conv, Command::Ack as u8, 0);
 
         let before = conn_b.stale_burst_count();
-        conn_b
-            .feed_raw_batch(vec![foreign, stale_ack.clone(), stale_ack])
-            .unwrap();
+        conn_b.feed_raw_batch(vec![foreign, stale_ack.clone(), stale_ack]);
         assert_eq!(
             conn_b.stale_burst_count(),
             before,
@@ -1909,12 +1907,10 @@ mod integ {
         // A wholly-stale burst still counts — that is the genuine re-dial
         // signal the eviction path exists for.
         let before = conn_b.stale_burst_count();
-        conn_b
-            .feed_raw_batch(vec![
-                header(0xDEAD_BEEF, Command::Push as u8, 0),
-                header(0xDEAD_BEEF, Command::Push as u8, 0),
-            ])
-            .unwrap();
+        conn_b.feed_raw_batch(vec![
+            header(0xDEAD_BEEF, Command::Push as u8, 0),
+            header(0xDEAD_BEEF, Command::Push as u8, 0),
+        ]);
         assert_eq!(
             conn_b.stale_burst_count(),
             before + 1,

@@ -353,12 +353,15 @@ impl SharedIoState {
     /// stale-session guard's unit: [`process_inbound_batch`] counts it as a
     /// previous generation only when every datagram in it mismatched, so a
     /// single late retransmission never evicts a live session.
-    pub(crate) fn feed_raw_batch(self: &Arc<Self>, mut datagrams: Vec<Vec<u8>>) -> io::Result<()> {
+    ///
+    /// Infallible: a closed endpoint and failed integrity checks recycle their
+    /// buffers and return.
+    pub(crate) fn feed_raw_batch(self: &Arc<Self>, mut datagrams: Vec<Vec<u8>>) {
         if self.is_closed() {
             for d in datagrams {
                 crate::sharded::recycle_buf(d);
             }
-            return Ok(());
+            return;
         }
         // Decrypt in place and compact the survivors to the front; a datagram
         // that fails the transport's integrity check is recycled, not parsed.
@@ -378,7 +381,7 @@ impl SharedIoState {
             crate::sharded::recycle_buf(d);
         }
         if datagrams.is_empty() {
-            return Ok(());
+            return;
         }
         self.mark_activity();
         let (data_ready, protocol_pending) = process_inbound_batch(self, &datagrams);
@@ -391,7 +394,6 @@ impl SharedIoState {
         for d in datagrams {
             crate::sharded::recycle_buf(d);
         }
-        Ok(())
     }
 
     /// Synchronous drain-and-flush. Used by the listener's inline
