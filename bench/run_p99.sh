@@ -77,6 +77,32 @@ cargo build -q --release -p kcp-rs --features async --example latency_p99
 echo "==> building kcp-go harness"
 (cd "$REPO/tests/kcp-go-latency" && go build -o kcp-go-latency .)
 
+# ── Load guard ────────────────────────────────────────────────────────────────
+# Abort when 1-min load exceeds ~70% of core count: a busy desktop produces
+# ±25% noise, and cross-day absolute numbers become meaningless (measured
+# 2026-09-24: the same Go↔Go control scored 94k and 48k on different days).
+# Override with BENCH_FORCE=1. Same rule as bench/run_bench.sh.
+check_load() {
+    [ "${BENCH_FORCE:-0}" = "1" ] && return 0
+    local ncpu load1 over
+    ncpu=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+    if [ -r /proc/loadavg ]; then
+        load1=$(cut -d' ' -f1 /proc/loadavg)
+    else
+        # macOS `sysctl vm.loadavg` prints "{ 7.04 11.07 9.72 }" (braces,
+        # variable spacing) — strip braces, then take the first number.
+        load1=$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}' | awk '{print $1}')
+    fi
+    [ -z "$load1" ] && return 0
+    over=$(awk -v l="$load1" -v n="$ncpu" 'BEGIN { print (l > n * 0.7) ? 1 : 0 }')
+    if [ "$over" = "1" ]; then
+        echo "❌ 1-min load ${load1} on ${ncpu} cores — results would be noise."
+        echo "   Quit heavy apps first, or re-run with BENCH_FORCE=1."
+        exit 1
+    fi
+}
+check_load
+
 # ── OS-level UDP buffer tuning (macOS) ──────────────────────────────────────
 # Increase kernel UDP socket buffers to prevent silent packet drops under
 # high-throughput KCP workloads. This is the single most effective OS tuning

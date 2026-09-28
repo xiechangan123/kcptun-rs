@@ -1,132 +1,87 @@
-//! Sharded worker pipeline architecture for high-concurrency UDP listeners.
-//!
-//! Three socket topologies, chosen by `worker_count`, bind mode, and OS:
+//! UDP listener: one receive task demuxes a shared socket, and each accepted
+//! session drives its own KCP state machine.
 //!
 //! ```text
-//! Direct single worker (worker_count == 1, every platform):
-//!   worker thread: recvmmsg → KCP → sendmmsg — one thread, own runtime
-//! Direct reuseport group (Linux, fresh bind, worker_count > 1):
-//!   kernel 4-tuple hash → N SO_REUSEPORT sockets → N direct worker threads
-//! Reader pipeline (shared socket + worker_count > 1: external sockets,
-//!   non-Linux fresh binds):
-//!   RX Thread (recvmmsg) → tokio-aware channel → Sharded Worker → TX (sendmmsg)
+//! rx task (one per listener, spawned on the caller's runtime)
+//!   recvmmsg → group the burst by source address (order preserved)
+//!        │
+//!        ├─ building peer  → per-session queue (bounded, drop-tail)
+//!        └─ live session   → feed_raw_batch(whole peer group) inline:
+//!                            one decrypt pass, ONE KCP lock, ONE flush, one
+//!                            sendmmsg for the group — no cross-task hop
+//!        ▼
+//! KcpStream task (the stream's own input loop drains the build queue +
+//! flush loop) → datagrams → shared socket
 //! ```
 //!
-//! # Design (by section number from the architecture doc)
+//! Grouping the burst before feeding is what keeps the stale-session guard
+//! honest: `process_inbound_batch` counts a burst as stale only when EVERY
+//! datagram in it mismatched the session (a re-dialed peer), so a single late
+//! retransmission mixed into a burst of fresh data must not evict the session.
+//! Feeding per datagram would make every datagram a one-packet burst and evict
+//! live sessions under loss — the bug this grouping exists to prevent.
 //!
-//! - **§4 RX hot path**: Direct workers drain their own socket via
-//!   `try_recv_batch_from_into` and process inline — no reader thread, no
-//!   channel, no cross-thread hop. The reader pipeline keeps a dedicated RX
-//!   thread that drains the shared socket and `try_send`s
-//!   `(SocketAddr, Vec<u8>)` into the correct worker's bounded channel; it
-//!   never decrypts, runs KCP, or awaits a send.
+//! The library opens no OS threads and no private runtime: the receive task
+//! and every session task are `knet::spawn_task`s on whatever runtime the
+//! caller built.
 //!
-//! - **§5 Worker**: Each worker is a long-lived **OS thread** owning a
-//!   `SessionMap` (`HashMap<SocketAddr, KcpStream>`). It drains its socket
-//!   or channel in batches and calls `feed_raw_batch` on each affected
-//!   session, which runs decrypt → FEC → KCP input → ACK flush → inline TX
-//!   all on the same thread. Each worker runs its own current-thread Tokio
-//!   runtime, and its idle park (`recv_from()` / `recv()`) registers with
-//!   that driver's epoll — the SAME wait serves the per-connection
-//!   flush-loop timers hosted on the runtime. No blocking wait ever freezes
-//!   the driver.
-//!
-//! - **§6 Session affinity**: Direct mode gets it from the kernel — a
-//!   SO_REUSEPORT group hashes each flow's 4-tuple to one socket, and a
-//!   single worker trivially owns every flow. The reader pipeline routes by
-//!   `fast_hash(peer) % worker_count` to a fixed worker.
-//!
-//! - **§10.2 Mode B (low latency)**: Workers build connections with
-//!   `background_input(false)`, so decrypt + KCP + encrypt all run on the
-//!   worker thread via `feed_raw_batch`. The flush loop runs on the
-//!   worker's current-thread runtime — no cross-thread scheduling hop for
-//!   the common sync send path.
-//!
-//! - **§14 Worker event loop**: bounded non-blocking drain (socket or
-//!   channel) → process → park inside the runtime driver, racing shutdown
-//!   against [`knet::CancellationToken`] so `close()` wakes parked workers
-//!   immediately (direct mode) — no timer polling while idle.
-//!
-//! - **§15 TX path**: `feed_raw_batch` → `feed_batch` already calls
-//!   `drain_and_flush_tx` which tries non-blocking `try_send_batch` on the
-//!   worker's socket. When the kernel send buffer is full (`WouldBlock`), it
-//!   falls back to the per-connection flush loop's async send path.
-//!
-//! - **§16 Batch strategy**: RX batch = 32 (`RECV_BATCH`); worker drain
-//!   batch = 64 (`WORKER_BATCH`). Bounded to prevent one hot shard from
-//!   starving others.
+//! Outbound datagrams of every session share the one unconnected listen
+//! socket. The syscall is safe to issue concurrently, but the kernel send
+//! buffer is socket-wide, so sends take a lock that covers only the syscall
+//! (see [`crate::transport::PeerTransport`]). A session that finds the buffer
+//! full drops the lock before retrying on a bounded timer, so one session's
+//! wait cannot stall the others' syscalls.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
 use crate::config::KcpConfig;
 use crate::conn::{kcp_config_setters, resolve_one, KcpStream};
-use crate::transport::{TransportWrapper, MAX_DATAGRAM};
+use crate::transport::{PeerQueue, PeerTransport, SharedSendLock, TransportWrapper, MAX_DATAGRAM};
 use knet::Notify;
 
-// ─── Worker RX queue (tokio-aware) ──────────────────────────────────────────
-//
-// The worker's inbound queue is an `async_channel` (MPMC, waker-based): the
-// worker parks inside its current-thread runtime driver via `recv().await`,
-// so the SAME epoll wait serves the queue AND the per-connection flush-loop
-// timers hosted on this runtime. The previous crossbeam channel required a
-// *blocking* `recv_timeout` inside the async context, which froze the runtime
-// driver — and with it every flush-loop timer on this shard — for up to the
-// park timeout. (pprof: crossbeam `recv_deadline`+`wait_until` ≈ 7% CPU.)
-use knet::{
-    Receiver as AsyncReceiver, Sender as AsyncSender, TrySendError as AsyncTrySendError,
-};
-/// RX batch size for `try_recv_batch_from_into` (§16: 16–32 is a good starting
-/// point for low-latency + throughput).
-const RECV_BATCH: usize = 32;
-/// Worker channel capacity. Bounded so a slow worker doesn't accumulate
-/// unbounded packets — the reader drops overflow (§4: "Worker ring full →
-/// drop + metric, never await"). Sized to absorb a transient OS-level worker
-/// stall: at ~12k pkt/s per session a 256-slot queue fills in ~21ms, and each
-/// dropped datagram costs a 30–200ms KCP RTO on the tail. 2048 slots absorb
-/// ~170ms of stall for ~2.9MB worst-case buffered datagrams per worker.
-const WORKER_CHANNEL_CAP: usize = 2048;
-/// Max datagrams a worker drains per event-loop cycle (§16: bound to prevent
-/// one hot shard from monopolizing the worker).
-const WORKER_BATCH: usize = 64;
-/// Even in unlimited mode, return to the executor after a bounded packet/time
-/// quantum so other workers and the acceptor get runtime service under flood.
-const DRAIN_QUANTUM: usize = 1_024;
-const DRAIN_QUANTUM_MS: u128 = 5;
-/// Max time (microseconds) a worker spends processing one batch of peers
-/// before yielding the CPU. Prevents a hot peer with heavy crypto/FEC from
-/// starving other peers' flush loops, reducing P999 tail latency.
-const WORKER_TIME_BUDGET_US: u64 = 2_000;
-/// Max number of consecutive batches a worker processes before yielding to
-/// the runtime. Under high throughput with a lightweight cipher (null, xor,
-/// none), each batch finishes in tens of microseconds — an unconditional
-/// `yield_now()` per batch makes scheduling overhead dominate. Instead we
-/// let the worker run multiple batches back-to-back, only yielding after this
-/// many cycles without a yield. The time-budget guard inside `process_batch`
-/// still fires for heavy ciphers / large multi-peer bursts, so flush-loop
-/// timers are never starved. Chosen as a power of two so the modulo check is
-/// a single `and`.
-const WORKER_BATCHES_PER_YIELD: u32 = 4;
+/// How many datagrams one receive wakeup pulls off the socket before yielding
+/// back to the caller's runtime. Bounds how long the receive task occupies a
+/// runtime worker under a flood. Must stay comfortably above a peer's
+/// congestion window: the stale-session guard evaluates whole bursts, so a
+/// ceiling near one peer's send window would split its traffic into
+/// mostly-fresh bursts and dilute the guard.
+const RECV_BATCH: usize = 256;
+
+/// Default bound on a session's inbound queue. A datagram that does not fit is
+/// dropped and counted; KCP retransmission recovers it. An unbounded queue
+/// would let one fast peer pin the listener's memory.
+const SESSION_INBOX_CAP: usize = 2048;
+
+/// How often the receive task reaps dead and idle sessions. With traffic the
+/// sweep still runs on this cadence — never per batch, so its O(sessions)
+/// clone-and-scan cannot scale with packet rate.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Max concurrent sessions before new peers are refused.
+///
+/// A server session is created from a single inbound datagram, so an unbounded
+/// map is a remote memory-exhaustion primitive. Raise it through
+/// [`WorkerPoolLimits`] to serve more.
+const DEFAULT_MAX_SESSIONS: usize = 4096;
+
+/// Default idle-session reap threshold. A KCP session with no inbound datagram
+/// and no successful write for this long is closed and removed.
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Default cap on how long a peer may sit in the `building` map.
+const DEFAULT_BUILDING_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ─── RX buffer pool (lock-free recycling) ─────────────────────────────────
-//
-// Recycle pool for RX datagram buffers.  The sharded `RxReader` allocates a
-// fresh 2048‑byte `Vec` per received datagram, which is consumed and dropped
-// in the worker after KCP input.  Under sustained load this creates allocator
-// contention (malloc/free per packet) that directly inflates P99 tail latency.
-// The pool keeps buffers alive so the fast path only pays a memset (≈ 100 ns
-// for 2 KB) instead of a full heap alloc + free.
 
 const BUFPOOL_CAP: usize = 4096;
 
-/// Either a Sender or Receiver — the pool is the pair.
 type BufRx = crossbeam_channel::Receiver<Vec<u8>>;
 type BufTx = crossbeam_channel::Sender<Vec<u8>>;
 
@@ -140,7 +95,7 @@ fn bufpool() -> &'static (BufTx, BufRx) {
     })
 }
 
-/// Return an empty RX buffer to the pool.  Only buffers with full MTU
+/// Return an empty RX buffer to the pool. Only buffers with full datagram
 /// capacity are retained; undersized buffers are freed as normal.
 #[inline]
 pub(crate) fn recycle_buf(mut buf: Vec<u8>) {
@@ -150,8 +105,8 @@ pub(crate) fn recycle_buf(mut buf: Vec<u8>) {
     }
 }
 
-/// Take a pooled buffer, or `None` when the pool is empty.
-/// The returned buffer has capacity `≥ MAX_DATAGRAM` and length 0.
+/// Take a pooled buffer, or `None` when the pool is empty. The returned buffer
+/// has capacity `≥ MAX_DATAGRAM` and length 0.
 #[inline]
 pub(crate) fn acquire_buf() -> Option<Vec<u8>> {
     match bufpool().1.try_recv() {
@@ -159,85 +114,36 @@ pub(crate) fn acquire_buf() -> Option<Vec<u8>> {
         _ => None,
     }
 }
-/// Upper bound on how long a worker parks with live sessions before running a
-/// lifecycle sweep. Without it a listener that goes completely silent never
-/// sweeps again — the sweep is driven by wakeups, and a silent shard has none,
-/// so abandoned sessions would be pinned until traffic resumed.
-const SWEEP_PARK_MS: u64 = 1_000;
-/// Max concurrent sessions per worker before admission-dropping new peers.
-///
-/// A server session is created from a single inbound datagram, so an unbounded
-/// map is a remote memory-exhaustion primitive. Multiply by the worker count
-/// for the listener-wide ceiling; raise it via [`WorkerPoolLimits`] if you
-/// really do serve more than this per shard.
-const DEFAULT_MAX_SESSIONS_PER_WORKER: usize = 4096;
-/// Default idle-session reap threshold. A KCP session with no inbound datagram
-/// and no successful write for this long is closed and removed.
-const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
-/// Default cap on how long a peer may sit in the `building` map.
-const DEFAULT_BUILDING_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Fast, stable hash for session affinity (§6). Uses FNV-1a on the socket
-/// address bytes — cheap, well-distributed, deterministic. Stack-assembled
-/// (no heap concat per routed packet).
-#[inline]
-fn fast_hash_peer(peer: &SocketAddr) -> u64 {
-    fn fnv1a(bytes: &[u8]) -> u64 {
-        let mut hash: u64 = 0xcbf29ce484222325;
-        for &byte in bytes {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        hash
-    }
-    match peer {
-        SocketAddr::V4(v4) => {
-            let mut bytes = [0u8; 6];
-            bytes[..4].copy_from_slice(&v4.ip().octets());
-            bytes[4..].copy_from_slice(&v4.port().to_le_bytes());
-            fnv1a(&bytes)
-        }
-        SocketAddr::V6(v6) => {
-            let mut bytes = [0u8; 18];
-            bytes[..16].copy_from_slice(&v6.ip().octets());
-            bytes[16..].copy_from_slice(&v6.port().to_le_bytes());
-            fnv1a(&bytes)
-        }
-    }
-}
-
-// ─── KcpListener ─────────────────────────────────────────────────────
+// ─── KcpListener ─────────────────────────────────────────────────────────
 
 /// Resource limits for [`KcpListener`].
-/// from the non-sharded listener but applies per-worker.
 #[derive(Debug, Clone, Copy)]
 pub struct WorkerPoolLimits {
-    /// Max concurrent sessions per worker (0 = unlimited).
+    /// Max concurrent sessions (0 = unlimited).
     pub max_sessions_per_worker: usize,
-    /// Drop-tail cap on each worker's channel (0 = use `WORKER_CHANNEL_CAP`).
+    /// Drop-tail cap on each session's inbound queue (0 = `SESSION_INBOX_CAP`).
     pub worker_channel_cap: usize,
-    /// Max datagrams routed per reader wakeup (0 = unlimited, bounded by
-    /// `DRAIN_QUANTUM`).
+    /// Max datagrams the receive task pulls per wakeup (0 = `RECV_BATCH`).
     pub max_drain_packets: usize,
-    /// A peer stuck in Building longer than this is reaped.
+    /// A peer stuck in `building` longer than this is forgotten.
     /// `Duration::ZERO` = no timeout.
     pub building_timeout: Duration,
-    /// A session with no inbound datagram and no successful write for this
-    /// long is closed and removed. `Duration::ZERO` = never reap on idleness.
+    /// A session with no inbound datagram and no successful write for this long
+    /// is closed and removed. `Duration::ZERO` = never reap on idleness.
     ///
     /// KCP has no keepalive of its own: an idle session emits nothing, so
-    /// `is_dead()` (retransmission budget exhausted) never trips for it and
+    /// `is_dead()` (retransmission budget exhausted) never trips for it, and
     /// without this timeout an abandoned peer is pinned until the process
-    /// exits. kcptun always runs SMUX keepalive on top, so real sessions
-    /// refresh their clock every `--keepalive` seconds.
+    /// exits.
     pub idle_timeout: Duration,
 }
 
 impl Default for WorkerPoolLimits {
     fn default() -> Self {
         Self {
-            max_sessions_per_worker: DEFAULT_MAX_SESSIONS_PER_WORKER,
-            worker_channel_cap: WORKER_CHANNEL_CAP,
+            max_sessions_per_worker: DEFAULT_MAX_SESSIONS,
+            worker_channel_cap: SESSION_INBOX_CAP,
             max_drain_packets: 0,
             building_timeout: DEFAULT_BUILDING_TIMEOUT,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
@@ -248,16 +154,16 @@ impl Default for WorkerPoolLimits {
 /// Live snapshot of [`KcpListener`] resource accounting.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WorkerPoolStats {
-    /// Total sessions across all workers.
+    /// Sessions currently in the map.
     pub sessions: usize,
-    /// Datagrams dropped because a worker's channel was full.
+    /// Datagrams dropped because a session's inbound queue was full.
     pub channel_drops: u64,
-    /// New sessions rejected because `max_sessions_per_worker` was reached.
+    /// New sessions refused because `max_sessions_per_worker` was reached.
     pub session_drops: u64,
     /// `KcpStream::build` failures.
     pub build_failures: u64,
     /// Datagrams from an unknown peer that failed the pre-admission integrity
-    /// check, so no session was created (spoofed / stray traffic).
+    /// check, so no session was created (spoofed or stray traffic).
     pub unauthenticated_drops: u64,
     /// Sessions closed and removed by the idle reaper.
     pub idle_reaps: u64,
@@ -265,7 +171,7 @@ pub struct WorkerPoolStats {
 
 /// Atomic counters behind [`KcpListener::stats`].
 #[derive(Default)]
-struct WorkerStats {
+struct ListenerStats {
     channel_drops: AtomicU64,
     session_drops: AtomicU64,
     build_failures: AtomicU64,
@@ -273,157 +179,53 @@ struct WorkerStats {
     idle_reaps: AtomicU64,
 }
 
-/// Per-worker shared state: one packet is destined for a worker, the source
-/// address and the raw datagram.
-type WorkerPacket = (SocketAddr, Vec<u8>);
-
-/// How a worker receives datagrams.
-enum WorkerRx {
-    /// Reader-thread → bounded tokio-aware channel (multi-worker listeners
-    /// on a shared socket: external sockets, non-Linux fresh binds). The
-    /// reader pushes with `try_send` (non-blocking); the worker parks in
-    /// `recv().await` inside its current-thread runtime, so the park shares
-    /// the driver's epoll wait with flush-loop timers (no blocking `recv`
-    /// on the async context).
-    Channel {
-        tx: AsyncSender<WorkerPacket>,
-        rx: AsyncReceiver<WorkerPacket>,
-    },
-    /// Direct mode: this worker owns a socket and drains it itself — no
-    /// reader thread, no channel, no cross-thread hop. Used by Linux
-    /// SO_REUSEPORT fresh binds (one socket per worker, kernel 4-tuple hash
-    /// provides affinity) and by single-worker listeners (the sole worker
-    /// takes over the only socket).
-    Direct { socket: Arc<knet::DatagramSocket> },
-}
-
-/// Per-worker state: receive source + the worker's session map.
-struct Worker {
-    rx: WorkerRx,
-    /// This worker's session map (§5: Worker owns its sessions, no
-    /// cross-thread lock on the hot path).
-    sessions: Mutex<HashMap<SocketAddr, KcpStream>>,
-    /// Peers currently being built (§10.1 staged build, generation-guarded).
-    building: Mutex<HashMap<SocketAddr, (u64, Instant)>>,
-    /// Worker generation counter for build-stale detection.
-    generation: AtomicU64,
-}
-
-impl Worker {
-    /// Channel-fed worker for the reader pipeline.
-    fn channel(cap: usize) -> Self {
-        let (tx, rx) = knet::bounded(cap);
-        Self {
-            rx: WorkerRx::Channel { tx, rx },
-            sessions: Mutex::new(HashMap::new()),
-            building: Mutex::new(HashMap::new()),
-            generation: AtomicU64::new(0),
-        }
-    }
-
-    /// Direct worker owning `socket` (a per-worker SO_REUSEPORT member or
-    /// the sole socket of a single-worker listener).
-    fn direct(socket: Arc<knet::DatagramSocket>) -> Self {
-        Self {
-            rx: WorkerRx::Direct { socket },
-            sessions: Mutex::new(HashMap::new()),
-            building: Mutex::new(HashMap::new()),
-            generation: AtomicU64::new(0),
-        }
-    }
-
-    /// The socket this worker uses for the session send path
-    /// ([`crate::transport::PeerTransport`]): direct workers send on their
-    /// own socket (independent send queues, same reuseport group as the
-    /// receive side); channel workers share the listener socket.
-    fn send_socket(&self, shared: &Arc<knet::DatagramSocket>) -> Arc<knet::DatagramSocket> {
-        match &self.rx {
-            WorkerRx::Channel { .. } => shared.clone(),
-            WorkerRx::Direct { socket } => socket.clone(),
-        }
-    }
-
-    fn direct_socket(&self) -> Option<&Arc<knet::DatagramSocket>> {
-        match &self.rx {
-            WorkerRx::Channel { .. } => None,
-            WorkerRx::Direct { socket } => Some(socket),
-        }
-    }
-
-    /// Route one packet to this worker via `try_send` (§4: never await).
-    /// On channel full, drop the packet and record a metric (KCP
-    /// retransmission recovers it). Direct workers never route through a
-    /// channel — the reader only exists on the channel pipeline.
-    fn route(&self, peer: SocketAddr, data: Vec<u8>, stats: &WorkerStats) {
-        let tx = match &self.rx {
-            WorkerRx::Channel { tx, .. } => tx,
-            WorkerRx::Direct { .. } => {
-                recycle_buf(data);
-                return;
-            }
-        };
-        match tx.try_send((peer, data)) {
-            Ok(()) => {}
-            Err(AsyncTrySendError::Full((_, data))) | Err(AsyncTrySendError::Closed((_, data))) => {
-                recycle_buf(data);
-                stats.channel_drops.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-
-    fn next_generation(&self) -> u64 {
-        self.generation.fetch_add(1, Ordering::Relaxed)
-    }
-
-    fn session_count(&self) -> usize {
-        self.sessions.lock().len()
-    }
-}
-
-/// KCP listener with a sharded worker pipeline. Depending on topology the
-/// workers either drain their own sockets directly (single worker, or a
-/// Linux SO_REUSEPORT fresh bind — no reader thread) or are fed from a
-/// dedicated reader thread over bounded channels (shared socket, N > 1).
-/// Every worker is an OS thread with a dedicated `current-thread` tokio
-/// runtime, isolated from the application's main async runtime to prevent
-/// scheduling interference. Workers own their sessions and run decrypt +
-/// KCP + encrypt on their own thread (§10.2 Mode B).
-pub struct KcpListener {
-    /// Listener socket for `local_addr`, and the shared send/RX socket on
-    /// the reader pipeline. On the direct-reuseport path the per-worker
-    /// sockets live in [`WorkerRx::Direct`] instead.
-    socket: Arc<knet::DatagramSocket>,
-    workers: Vec<Arc<Worker>>,
-    pending: Arc<Mutex<VecDeque<PendingAccept>>>,
-    accept_notify: Arc<Notify>,
-    closed: Arc<AtomicBool>,
-    last_error: Arc<Mutex<Option<io::Error>>>,
-    stats: Arc<WorkerStats>,
-    /// Wakes direct workers parked in `recv_from` the moment [`close()`](Self::close)
-    /// fires (shared with the builder-created sockets' shutdown path).
-    stop: knet::CancellationToken,
-    /// Reader thread of the channel pipeline. `None` in direct mode —
-    /// workers drain their own sockets and there is nothing to join.
-    _reader: Option<JoinHandle<()>>,
-    _workers: Vec<JoinHandle<()>>,
-}
-
 struct PendingAccept {
     conn: KcpStream,
     peer: SocketAddr,
 }
 
+/// `(queue, started, build generation)` for a peer whose session is under
+/// construction.
+type BuildingEntry = (Arc<PeerQueue>, Instant, u64);
+
+/// One accepted peer. The build queue is not held here: the session's
+/// transport owns it (and drains it during the building window), so the map
+/// entry needs only the connection handle.
+struct Session {
+    conn: KcpStream,
+}
+
+/// KCP listener over one shared UDP socket.
+///
+/// A single receive task demultiplexes inbound datagrams by source address
+/// into per-session queues. Each accepted [`KcpStream`] runs its own input and
+/// flush tasks on the caller's runtime, so the listener opens no threads of
+/// its own.
+pub struct KcpListener {
+    socket: Arc<knet::DatagramSocket>,
+    sessions: Arc<Mutex<HashMap<SocketAddr, Session>>>,
+    pending: Arc<Mutex<VecDeque<PendingAccept>>>,
+    accept_notify: Arc<Notify>,
+    closed: Arc<AtomicBool>,
+    /// Cancels the receive task's socket read the moment [`close`](Self::close)
+    /// runs, so shutdown does not wait out the sweep interval.
+    stop: knet::CancellationToken,
+    last_error: Arc<Mutex<Option<io::Error>>>,
+    stats: Arc<ListenerStats>,
+    _rx: knet::JoinHandle<()>,
+}
+
 impl Drop for KcpListener {
     fn drop(&mut self) {
+        // `close()` only stops accept. Drop is what ends the receive task, so
+        // a discarded listener does not keep reading the socket.
         self.close();
+        self.stop.cancel();
     }
 }
 
 impl KcpListener {
-    /// Bind a UDP socket on `addr` and return a builder for the sharded
-    /// listener pipeline.
-    ///
-    /// This is the primary entry point for UDP listeners.
+    /// Bind a UDP socket on `addr` and return a builder.
     pub fn bind(addr: impl ToSocketAddrs) -> KcpListenerBuilder {
         bind_listener(addr)
     }
@@ -433,34 +235,46 @@ impl KcpListener {
         from_socket_listener(socket)
     }
 
-    /// Remove a peer from the worker's session map after its accepted
-    /// connection ends. A later datagram from the same address creates a
-    /// fresh connection and is surfaced by [`accept`](Self::accept),
-    /// matching kcptun reconnect behavior.
+    /// Remove a peer from the session map after its accepted connection ends.
+    /// A later datagram from the same address creates a fresh connection and is
+    /// surfaced by [`accept`](Self::accept).
     ///
-    /// The removed session is closed: the map holds the last non-owning
-    /// clone, so dropping it would leave the flush loop and the input-side
-    /// wakers running until the process exits.
+    /// The removed session is closed: the map holds the last non-owning clone,
+    /// so dropping it would leave the flush loop running until the process
+    /// exits. A not-yet-accepted build for the same peer is dropped too, so
+    /// [`accept`](Self::accept) cannot hand out a connection this call just
+    /// tore down.
     pub fn remove_peer(&self, peer: SocketAddr) -> bool {
-        let mut removed = false;
-        for w in &self.workers {
-            let evicted = w.sessions.lock().remove(&peer);
-            if let Some(conn) = evicted {
-                conn.close();
-                removed = true;
+        let stale: Vec<PendingAccept> = {
+            let mut pending = self.pending.lock();
+            let mut kept = VecDeque::new();
+            let mut stale = Vec::new();
+            for p in pending.drain(..) {
+                if p.peer == peer {
+                    stale.push(p);
+                } else {
+                    kept.push_back(p);
+                }
             }
+            *pending = kept;
+            stale
+        };
+        for mut p in stale {
+            p.conn.attach_owner();
+            p.conn.close();
         }
-        removed
+        let removed = self.sessions.lock().remove(&peer);
+        if let Some(session) = removed {
+            session.conn.close();
+            true
+        } else {
+            false
+        }
     }
 
-    /// Current number of known peer sessions across all workers.
+    /// Current number of known peer sessions.
     pub fn session_count(&self) -> usize {
-        self.workers.iter().map(|w| w.session_count()).sum()
-    }
-
-    /// Number of worker tasks.
-    pub fn worker_count(&self) -> usize {
-        self.workers.len()
+        self.sessions.lock().len()
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -470,9 +284,14 @@ impl KcpListener {
     /// Accept the next client connection.
     pub async fn accept(&self) -> io::Result<(KcpStream, SocketAddr)> {
         loop {
+            if self.closed.load(Ordering::Acquire) {
+                self.discard_pending();
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "KcpListener closed",
+                ));
+            }
             if let Some(mut v) = self.pending.lock().pop_front() {
-                // Mark the accepted stream as the connection owner so dropping
-                // it closes the session instead of leaking until the reaper.
                 v.conn.attach_owner();
                 return Ok((v.conn, v.peer));
             }
@@ -483,6 +302,13 @@ impl KcpListener {
                 ));
             }
             let notified = self.accept_notify.notified();
+            if self.closed.load(Ordering::Acquire) {
+                self.discard_pending();
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "KcpListener closed",
+                ));
+            }
             if let Some(mut v) = self.pending.lock().pop_front() {
                 v.conn.attach_owner();
                 return Ok((v.conn, v.peer));
@@ -500,6 +326,13 @@ impl KcpListener {
 
     /// Non-blocking accept.
     pub fn try_accept(&self) -> io::Result<Option<(KcpStream, SocketAddr)>> {
+        if self.closed.load(Ordering::Acquire) {
+            self.discard_pending();
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "KcpListener closed",
+            ));
+        }
         if let Some(mut v) = self.pending.lock().pop_front() {
             v.conn.attach_owner();
             return Ok(Some((v.conn, v.peer)));
@@ -518,26 +351,56 @@ impl KcpListener {
         Ok(self.last_error.lock().take())
     }
 
-    /// Stop accepting and wake parked workers. Existing `KcpStream`s are
-    /// unaffected. Direct workers parked on their socket `recv_from` are
-    /// woken immediately via the cancel token; channel workers observe the
-    /// flag on their next wakeup (traffic or caller-driven shutdown).
+    /// Stop accepting new connections. A connection already returned by
+    /// [`accept`](Self::accept) keeps running: the receive task stays up,
+    /// because it still needs inbound datagrams. A session that hits a full
+    /// send buffer retries on its own bounded timer and does not depend on any
+    /// listener task.
+    ///
+    /// A connection that was built but not yet accepted is closed here, and so
+    /// is one whose build finishes after this call. Both tasks end when the
+    /// listener is dropped.
     pub fn close(&self) {
         if self
             .closed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            self.stop.cancel();
+            self.discard_pending();
             self.accept_notify.notify_waiters();
+        }
+    }
+
+    /// Close every connection waiting to be accepted. Called once `closed` is
+    /// set, so a build that finished in the meantime is not handed out.
+    fn discard_pending(&self) {
+        // The lock is released before the session map is touched. The build
+        // path takes the map first and this queue second, so holding both here
+        // would deadlock against it.
+        let queued: Vec<PendingAccept> = self.pending.lock().drain(..).collect();
+        for mut pending in queued {
+            // The backlog holds the owner clone; closing it tears the session
+            // down instead of leaving the flush loop running.
+            pending.conn.attach_owner();
+            pending.conn.close();
+            // Drop the map entry only when it is *this* connection. A stale
+            // backlog row for a re-dialed peer must not evict the live
+            // replacement that already took its place.
+            let mut sessions = self.sessions.lock();
+            if sessions
+                .get(&pending.peer)
+                .map(|s| s.conn.is_closed())
+                .unwrap_or(false)
+            {
+                sessions.remove(&pending.peer);
+            }
         }
     }
 
     /// Live resource-accounting snapshot.
     pub fn stats(&self) -> WorkerPoolStats {
-        let sessions: usize = self.workers.iter().map(|w| w.session_count()).sum();
         WorkerPoolStats {
-            sessions,
+            sessions: self.sessions.lock().len(),
             channel_drops: self.stats.channel_drops.load(Ordering::Relaxed),
             session_drops: self.stats.session_drops.load(Ordering::Relaxed),
             build_failures: self.stats.build_failures.load(Ordering::Relaxed),
@@ -547,50 +410,7 @@ impl KcpListener {
     }
 }
 
-// ─── Builder ────────────────────────────────────────────────────────────────
-
-/// Socket topology chosen at build time (see module docs).
-enum Topology {
-    /// Each worker drains its own socket — no reader thread, no channels.
-    /// One socket: a single-worker listener (any platform). N sockets: a
-    /// Linux SO_REUSEPORT group with per-flow kernel affinity.
-    Direct(Vec<Arc<knet::DatagramSocket>>),
-    /// One shared socket fanned out to channel workers by a reader thread
-    /// (external sockets with N > 1, non-Linux multi-worker fresh binds).
-    Shared(Arc<knet::DatagramSocket>),
-}
-
-/// Fresh bind with `worker_count` workers: a single worker takes the socket
-/// over directly; N > 1 workers on Linux get a per-worker SO_REUSEPORT
-/// group (kernel 4-tuple hash = session affinity, no user-space demux).
-fn fresh_bind_topology(addr: SocketAddr, worker_count: usize) -> io::Result<Topology> {
-    if worker_count == 1 {
-        return Ok(Topology::Direct(vec![Arc::new(knet::DatagramSocket::Udp(
-            knet::UdpSocket::bind(addr)?,
-        ))]));
-    }
-    #[cfg(target_os = "linux")]
-    {
-        // All group members must set SO_REUSEPORT before the group's first
-        // bind; every socket here is created that way.
-        let sockets = (0..worker_count)
-            .map(|_| {
-                Ok::<_, io::Error>(Arc::new(knet::DatagramSocket::Udp(
-                    knet::UdpSocket::bind_reuseport(addr)?,
-                )))
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        Ok(Topology::Direct(sockets))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        // SO_REUSEPORT does not load-balance UDP flows on this platform —
-        // share one socket through the reader pipeline instead.
-        Ok(Topology::Shared(Arc::new(knet::DatagramSocket::Udp(
-            knet::UdpSocket::bind(addr)?,
-        ))))
-    }
-}
+// ─── Builder ────────────────────────────────────────────────────────────
 
 /// Builder for [`KcpListener`].
 pub struct KcpListenerBuilder {
@@ -599,8 +419,11 @@ pub struct KcpListenerBuilder {
     config: KcpConfig,
     resolve_err: Option<io::Error>,
     transport_wrapper: Option<TransportWrapper>,
-    worker_count: usize,
     limits: Option<WorkerPoolLimits>,
+    /// Test hook: sleep this long after `KcpStream::build()` returns and
+    /// before the session is published, so a `close()` can land on a finished
+    /// but not-yet-queued build. `Duration::ZERO` disables it.
+    testing_build_delay: Duration,
 }
 
 impl KcpListenerBuilder {
@@ -609,24 +432,12 @@ impl KcpListenerBuilder {
     /// Wrap each accepted peer transport before constructing its `KcpStream`.
     pub fn transport_wrapper<F>(mut self, wrapper: F) -> Self
     where
-        F: Fn(
-                Arc<dyn crate::transport::PacketTransport>,
-                SocketAddr,
-            ) -> Arc<dyn crate::transport::PacketTransport>
+        F: Fn(Arc<dyn crate::transport::PacketTransport>, SocketAddr) -> Arc<dyn crate::transport::PacketTransport>
             + Send
             + Sync
             + 'static,
     {
         self.transport_wrapper = Some(Arc::new(wrapper));
-        self
-    }
-
-    /// Number of listener shards.
-    ///
-    /// An explicit value overrides `KCPTUN_WORKER_THREADS`. Without either,
-    /// the default is available parallelism clamped to [1, 16].
-    pub fn worker_count(mut self, n: usize) -> Self {
-        self.worker_count = n.max(1);
         self
     }
 
@@ -636,129 +447,77 @@ impl KcpListenerBuilder {
         self
     }
 
-    /// Bind the listen socket, spawn workers (and the reader when the
-    /// topology needs one), and return the listener.
+    /// Test hook: hold a finished build before publishing it, so `close()` can
+    /// race an in-flight build deterministically. Not for production use.
+    #[doc(hidden)]
+    pub fn testing_build_delay(mut self, delay: Duration) -> Self {
+        self.testing_build_delay = delay;
+        self
+    }
+
+    /// Bind the listen socket, spawn the receive task, and return the listener.
     ///
-    /// Workers run on dedicated OS threads, each with its own `current-thread`
-    /// tokio runtime. This isolates KCP processing from the application's
-    /// main async runtime, preventing scheduling interference.
-    ///
-    /// Topology selection (see module docs): fresh binds with one worker use
-    /// a direct socket takeover on every platform; fresh binds with N > 1
-    /// workers use a per-worker SO_REUSEPORT group on Linux and the reader
-    /// pipeline elsewhere; external sockets ([`from_socket`](Self::from_socket))
-    /// are direct with a single worker, reader-fed otherwise.
+    /// The receive task and every accepted session's tasks run on the caller's
+    /// runtime. The listener creates none of its own.
     pub async fn build(self) -> io::Result<KcpListener> {
         if let Some(e) = self.resolve_err {
             return Err(e);
         }
 
-        let limits = self.limits.unwrap_or_default();
-        let worker_count = if self.worker_count == 0 {
-            num_cpus()
-        } else {
-            self.worker_count
-        };
-
-        let topology = match self.socket {
-            Some(s) => {
-                if worker_count == 1 {
-                    // Sole worker: take over the caller's socket directly —
-                    // no reader thread, no channel hop.
-                    Topology::Direct(vec![s])
-                } else {
-                    // An external socket cannot be split per-worker: keep
-                    // the reader pipeline (preserves caller socket options).
-                    Topology::Shared(s)
-                }
-            }
+        let socket = match self.socket {
+            Some(s) => s,
             None => {
                 let addr = self.addr.ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "KcpListener: bind address required",
-                    )
+                    io::Error::new(io::ErrorKind::InvalidInput, "KcpListener: bind address required")
                 })?;
-                fresh_bind_topology(addr, worker_count)?
+                Arc::new(knet::DatagramSocket::Udp(knet::UdpSocket::bind(addr)?))
             }
         };
 
-        let stats = Arc::new(WorkerStats::default());
+        let limits = self.limits.unwrap_or_default();
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let building = Arc::new(Mutex::new(HashMap::new()));
         let pending = Arc::new(Mutex::new(VecDeque::new()));
         let accept_notify = Arc::new(Notify::new());
         let closed = Arc::new(AtomicBool::new(false));
-        let last_error = Arc::new(Mutex::new(None::<io::Error>));
         let stop = knet::CancellationToken::new();
+        let last_error = Arc::new(Mutex::new(None));
+        let stats = Arc::new(ListenerStats::default());
+        let send_lock = SharedSendLock::new();
 
-        // Build the worker set from the topology.
-        let (workers, socket): (Vec<Arc<Worker>>, Arc<knet::DatagramSocket>) = match topology {
-            Topology::Direct(sockets) => {
-                let workers = sockets
-                    .iter()
-                    .map(|s| Arc::new(Worker::direct(s.clone())))
-                    .collect();
-                // `local_addr()` needs a listener-level socket; any member
-                // reports the same bound address. Keep the first alive.
-                let primary = sockets[0].clone();
-                (workers, primary)
-            }
-            Topology::Shared(s) => {
-                let workers = (0..worker_count)
-                    .map(|_| Arc::new(Worker::channel(limits.worker_channel_cap)))
-                    .collect();
-                (workers, s)
-            }
-        };
-
-        // Spawn worker threads (each with its own current-thread runtime).
-        let worker_handles: Vec<JoinHandle<()>> = workers
-            .iter()
-            .map(|w| {
-                spawn_worker(
-                    w.clone(),
-                    socket.clone(),
-                    self.config.clone(),
-                    self.transport_wrapper.clone(),
-                    limits,
-                    pending.clone(),
-                    accept_notify.clone(),
-                    stats.clone(),
-                    closed.clone(),
-                    stop.clone(),
-                    last_error.clone(),
-                )
-            })
-            .collect();
-
-        // Reader thread only for the shared-socket pipeline (with its own
-        // multi-thread runtime for async recv_from).
-        let reader = match &workers[0].rx {
-            WorkerRx::Channel { .. } => Some(spawn_sharded_reader(
-                socket.clone(),
-                workers.clone(),
-                limits,
-                stats.clone(),
-                closed.clone(),
-                last_error.clone(),
-            )),
-            WorkerRx::Direct { .. } => None,
-        };
+        let rx = spawn_rx(RxArgs {
+            socket: socket.clone(),
+            sessions: sessions.clone(),
+            building: building.clone(),
+            build_gen: AtomicU64::new(0),
+            pending: pending.clone(),
+            accept_notify: accept_notify.clone(),
+            closed: closed.clone(),
+            stop: stop.clone(),
+            last_error: last_error.clone(),
+            stats: stats.clone(),
+            send_lock,
+            config: self.config,
+            transport_wrapper: self.transport_wrapper,
+            limits,
+            testing_build_delay: self.testing_build_delay,
+        });
 
         Ok(KcpListener {
             socket,
-            workers,
+            sessions,
             pending,
             accept_notify,
             closed,
+            stop,
             last_error,
             stats,
-            stop,
-            _reader: reader,
-            _workers: worker_handles,
+            _rx: rx,
         })
     }
 }
 
+/// `KcpListener::bind(addr).await` — awaitable without an explicit `.build()`.
 impl std::future::IntoFuture for KcpListenerBuilder {
     type Output = io::Result<KcpListener>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
@@ -768,7 +527,7 @@ impl std::future::IntoFuture for KcpListenerBuilder {
     }
 }
 
-/// Entry point for building a sharded listener.
+/// Bind a UDP socket on `addr` and return a builder for the listener.
 pub fn bind_listener(addr: impl ToSocketAddrs) -> KcpListenerBuilder {
     match resolve_one(addr) {
         Ok(a) => KcpListenerBuilder {
@@ -777,8 +536,8 @@ pub fn bind_listener(addr: impl ToSocketAddrs) -> KcpListenerBuilder {
             config: KcpConfig::default(),
             resolve_err: None,
             transport_wrapper: None,
-            worker_count: 0,
             limits: None,
+            testing_build_delay: Duration::ZERO,
         },
         Err(e) => KcpListenerBuilder {
             addr: None,
@@ -786,13 +545,13 @@ pub fn bind_listener(addr: impl ToSocketAddrs) -> KcpListenerBuilder {
             config: KcpConfig::default(),
             resolve_err: Some(e),
             transport_wrapper: None,
-            worker_count: 0,
             limits: None,
+            testing_build_delay: Duration::ZERO,
         },
     }
 }
 
-/// Use an already-bound socket.
+/// Build a listener on an already-bound datagram socket.
 pub fn from_socket_listener(socket: Arc<knet::DatagramSocket>) -> KcpListenerBuilder {
     KcpListenerBuilder {
         addr: None,
@@ -800,758 +559,417 @@ pub fn from_socket_listener(socket: Arc<knet::DatagramSocket>) -> KcpListenerBui
         config: KcpConfig::default(),
         resolve_err: None,
         transport_wrapper: None,
-        worker_count: 0,
         limits: None,
+        testing_build_delay: Duration::ZERO,
     }
 }
 
-/// Get the default shard count for the listener pipeline.
-///
-/// A positive `KCPTUN_WORKER_THREADS` value overrides auto-detection. Invalid
-/// values and zero fall back to available parallelism clamped to [1, 16].
-fn num_cpus() -> usize {
-    if let Ok(value) = std::env::var("KCPTUN_WORKER_THREADS") {
-        if let Ok(worker_count) = value.parse::<usize>() {
-            if worker_count > 0 {
-                return worker_count;
-            }
-        }
-    }
+// ─── Receive task ───────────────────────────────────────────────────────
 
-    let n = std::thread::available_parallelism()
-        .map(|v| v.get())
-        .unwrap_or(1);
-    n.clamp(1, 16)
-}
-
-// ─── Reader (§4: RX hot path — never wait downstream) ───────────────────────
-
-fn spawn_sharded_reader(
+struct RxArgs {
     socket: Arc<knet::DatagramSocket>,
-    workers: Vec<Arc<Worker>>,
-    limits: WorkerPoolLimits,
-    stats: Arc<WorkerStats>,
-    closed: Arc<AtomicBool>,
-    last_error: Arc<Mutex<Option<io::Error>>>,
-) -> JoinHandle<()> {
-    thread::Builder::new()
-        .name("kcp-reader".into())
-        .spawn(move || {
-            knet::block_on_multi_thread(async move {
-                let mut buf = vec![0u8; MAX_DATAGRAM];
-                let mut spares: Vec<Vec<u8>> =
-                    (0..RECV_BATCH).map(|_| vec![0u8; MAX_DATAGRAM]).collect();
-                let mut peers: Vec<SocketAddr> = Vec::with_capacity(RECV_BATCH);
-                let worker_count = workers.len();
-
-                loop {
-                    if closed.load(Ordering::Acquire) {
-                        break;
-                    }
-
-                    // Block on the first packet (§4: recv_from is the only blocking
-                    // call; everything else is non-blocking try_push).
-                    if buf.capacity() < MAX_DATAGRAM {
-                        buf = crate::sharded::acquire_buf()
-                            .unwrap_or_else(|| vec![0u8; MAX_DATAGRAM]);
-                    }
-                    buf.resize(MAX_DATAGRAM, 0);
-                    let (n, peer) = match socket.recv_from(&mut buf).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            *last_error.lock() = Some(e);
-                            knet::sleep_ms(10).await;
-                            continue;
-                        }
-                    };
-                    buf.truncate(n);
-
-                    // Route the first packet.
-                    let shard = (fast_hash_peer(&peer) as usize) % worker_count;
-                    workers[shard].route(peer, std::mem::take(&mut buf), &stats);
-
-                    // Drain remaining packets non-blocking (§4: recvmmsg batch).
-                    while spares.len() < RECV_BATCH {
-                        spares.push(
-                            crate::sharded::acquire_buf()
-                                .unwrap_or_else(|| vec![0u8; MAX_DATAGRAM]),
-                        );
-                    }
-                    let mut drained: usize = 1;
-                    let drain_started = Instant::now();
-                    let mut quantum_hit =
-                        limits.max_drain_packets > 0 && drained >= limits.max_drain_packets;
-
-                    while !quantum_hit {
-                        let recv_cap = if limits.max_drain_packets > 0 {
-                            limits
-                                .max_drain_packets
-                                .saturating_sub(drained)
-                                .min(spares.len())
-                        } else {
-                            spares.len().min(RECV_BATCH)
-                        };
-                        if recv_cap == 0 {
-                            quantum_hit = true;
-                            break;
-                        }
-                        let got = match socket
-                            .try_recv_batch_from_into(&mut spares[..recv_cap], &mut peers)
-                        {
-                            Ok(got) => got,
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                            Err(e) => {
-                                *last_error.lock() = Some(e);
-                                break;
-                            }
-                        };
-                        if got == 0 {
-                            break;
-                        }
-                        for i in 0..got {
-                            let s = (fast_hash_peer(&peers[i]) as usize) % worker_count;
-                            workers[s].route(peers[i], std::mem::take(&mut spares[i]), &stats);
-                        }
-                        drained += got;
-                        quantum_hit = (limits.max_drain_packets > 0
-                            && drained >= limits.max_drain_packets)
-                            || (limits.max_drain_packets == 0
-                                && (drained >= DRAIN_QUANTUM
-                                    || drain_started.elapsed().as_millis() >= DRAIN_QUANTUM_MS));
-                    }
-
-                    // Spare pool maintenance.
-                    spares.retain(|s| s.capacity() >= MAX_DATAGRAM);
-
-                    if quantum_hit {
-                        knet::yield_now().await;
-                    }
-                }
-            });
-        })
-        .expect("spawn kcp-reader thread")
-}
-
-// ─── Worker (§5, §14: long-lived event loop) ────────────────────────────────
-
-/// Spawn one worker thread: it owns its shard's session map and drives the
-/// decrypt → KCP → encrypt pipeline (§10.2 Mode B). The receive source comes
-/// from the worker's [`WorkerRx`]: direct workers recvmmsg-drain their own
-/// socket inside the runtime driver; channel workers drain their bounded
-/// tokio-aware queue. Either way the idle park shares the driver's epoll
-/// wait with the per-connection flush-loop timers hosted here — no blocking
-/// wait ever freezes the runtime (§14).
-#[allow(clippy::too_many_arguments)]
-fn spawn_worker(
-    worker: Arc<Worker>,
-    shared_socket: Arc<knet::DatagramSocket>,
-    config: KcpConfig,
-    transport_wrapper: Option<TransportWrapper>,
-    limits: WorkerPoolLimits,
+    sessions: Arc<Mutex<HashMap<SocketAddr, Session>>>,
+    /// Peers whose session is being built. Datagrams that arrive in that window
+    /// go to the queue the build owns, instead of opening a second session.
+    /// The `u64` is the build's generation: a build that outlives its
+    /// `building_timeout` is forgotten, and only the build that still owns the
+    /// slot may publish the session (so a slow build cannot overwrite a
+    /// replacement that already took its place).
+    building: Arc<Mutex<HashMap<SocketAddr, BuildingEntry>>>,
+    /// Source of [`Self::building`] generations.
+    build_gen: AtomicU64,
     pending: Arc<Mutex<VecDeque<PendingAccept>>>,
     accept_notify: Arc<Notify>,
-    stats: Arc<WorkerStats>,
     closed: Arc<AtomicBool>,
     stop: knet::CancellationToken,
     last_error: Arc<Mutex<Option<io::Error>>>,
-) -> JoinHandle<()> {
-    // Session send path: direct workers send on their own socket
-    // (independent send queues, same reuseport group); channel workers
-    // share the listener socket.
-    let socket = worker.send_socket(&shared_socket);
-    thread::Builder::new()
-        .name("kcp-worker".into())
-        .spawn(move || {
-            // This OS thread owns the shard. A current-thread runtime keeps
-            // the receive park local to this shard; using the global runtime
-            // lets idle shards occupy every shared Tokio worker and turns
-            // the park into a process-wide latency spike.
-            knet::block_on_local(async move {
-                // Lifecycle sweeper: reaping used to piggyback on RX wakeups,
-                // so a shard that went completely silent stopped sweeping and
-                // pinned every abandoned session until traffic resumed. Run it
-                // on a timer instead, as a task on this worker's own
-                // current-thread runtime (the same driver that hosts the
-                // sessions' flush loops), and stop it with the listener.
-                {
-                    let worker = worker.clone();
-                    let stats = stats.clone();
-                    let closed = closed.clone();
-                    let stop = stop.clone();
-                    knet::spawn_task(async move {
-                        loop {
-                            match knet::race(
-                                stop.cancelled(),
-                                Box::pin(knet::sleep_ms(SWEEP_PARK_MS)),
-                            )
-                            .await
-                            {
-                                knet::RaceOutcome::First(()) => break,
-                                knet::RaceOutcome::Second(()) => {}
-                            }
-                            if closed.load(Ordering::Acquire) {
-                                break;
-                            }
-                            reaper_sweep(&worker, &limits, &stats);
-                        }
-                    });
-                }
-
-                // Batch drain buffer (§14: drain_udp_batch).
-                let mut batch: Vec<WorkerPacket> = Vec::with_capacity(WORKER_BATCH);
-                // Deferred peers from a previous over-budget round (see the
-                // WORKER_TIME_BUDGET_US break below). Carried over locally
-                // instead of re-queueing through the channel — a full channel
-                // would silently drop the datagrams, and a dropped segment
-                // recovers only via a 30–200ms KCP RTO.
-                let mut deferred: Vec<(SocketAddr, Vec<Vec<u8>>)> = Vec::new();
-                let mut by_peer: HashMap<SocketAddr, Vec<Vec<u8>>> = HashMap::new();
-                let mut affected: Vec<SocketAddr> = Vec::new();
-                let mut affected_seen: HashSet<SocketAddr> = HashSet::new();
-                // Batches processed since the last yield. When this reaches
-                // `WORKER_BATCHES_PER_YIELD` we yield to let flush-loop timers
-                // run. Reset to 0 on any yield (here, inside `process_batch`'s
-                // time-budget path, or after a park).
-                let mut batches_since_yield: u32 = 0;
-
-                // Direct-mode receive state: pooled slots for the recvmmsg
-                // burst drain, plus a parked-read slot (also pooled).
-                let mut slots: Vec<Vec<u8>> = Vec::new();
-                let mut peers: Vec<SocketAddr> = Vec::new();
-                let mut parked_slot: Vec<u8> = Vec::new();
-                if worker.direct_socket().is_some() {
-                    slots = (0..RECV_BATCH).map(|_| vec![0u8; MAX_DATAGRAM]).collect();
-                    peers = Vec::with_capacity(RECV_BATCH);
-                    parked_slot = vec![0u8; MAX_DATAGRAM];
-                }
-
-                loop {
-                    if closed.load(Ordering::Acquire) {
-                        break;
-                    }
-
-                    // Deferred carry-over from a previous over-budget round:
-                    // processed before fresh arrivals to preserve
-                    // per-peer ordering.
-                    if !deferred.is_empty() {
-                        let taken = std::mem::take(&mut deferred);
-                        for (peer, dgrams) in taken {
-                            process_session(
-                                &worker,
-                                &peer,
-                                dgrams,
-                                &socket,
-                                &config,
-                                &transport_wrapper,
-                                &limits,
-                                &pending,
-                                &accept_notify,
-                                &stats,
-                            )
-                            .await;
-                        }
-                    }
-
-                    // ── Fill the batch from this worker's RX source ──
-                    batch.clear();
-                    let mut drained: usize = match &worker.rx {
-                        WorkerRx::Channel { rx, .. } => {
-                            // Non-blocking drain of the worker's channel, up
-                            // to WORKER_BATCH.
-                            for _ in 0..WORKER_BATCH {
-                                match rx.try_recv() {
-                                    Ok(pkt) => batch.push(pkt),
-                                    Err(_) => break,
-                                }
-                            }
-                            batch.len()
-                        }
-                        WorkerRx::Direct { socket: rx_socket } => drain_own_socket(
-                            rx_socket,
-                            &mut batch,
-                            &mut slots,
-                            &mut peers,
-                            &limits,
-                            &last_error,
-                            0,
-                        ),
-                    };
-
-                    if batch.is_empty() {
-                        // No work — park **inside the runtime driver**: both
-                        // receive sources register with this worker's
-                        // current-thread runtime, so the SAME epoll wait
-                        // serves the RX source and the per-connection
-                        // flush-loop timers hosted here. (The historical
-                        // crossbeam `recv_timeout` was a *blocking* call in
-                        // async context: it froze the driver — and every
-                        // flush timer on the shard — for up to the park
-                        // timeout; pprof showed recv_deadline+wait_until
-                        // ≈ 7% CPU even at full load.)
-                        match &worker.rx {
-                            WorkerRx::Channel { rx, .. } => match rx.recv().await {
-                                Ok(first) => {
-                                    batch.push(first);
-                                    // Drain more that arrived during wake.
-                                    for _ in 0..WORKER_BATCH - 1 {
-                                        match rx.try_recv() {
-                                            Ok(p) => batch.push(p),
-                                            Err(_) => break,
-                                        }
-                                    }
-                                    drained = batch.len();
-                                }
-                                Err(_) => break, // channel closed (never in practice)
-                            },
-                            WorkerRx::Direct { socket: rx_socket } => {
-                                // First packet blocks into a pooled slot,
-                                // raced against shutdown so `close()` wakes
-                                // a parked worker immediately (no timer
-                                // polling while idle).
-                                parked_slot.resize(MAX_DATAGRAM, 0);
-                                match knet::race(
-                                    stop.cancelled(),
-                                    Box::pin(rx_socket.recv_from(&mut parked_slot)),
-                                )
-                                .await
-                                {
-                                    knet::RaceOutcome::First(()) => continue,
-                                    knet::RaceOutcome::Second(Ok((n, peer))) if n > 0 => {
-                                        parked_slot.truncate(n);
-                                        batch.push((peer, std::mem::take(&mut parked_slot)));
-                                        // The rest of the burst is already in
-                                        // the kernel buffer — drain it too.
-                                        let parked = 1;
-                                        drained = parked
-                                            + drain_own_socket(
-                                                rx_socket,
-                                                &mut batch,
-                                                &mut slots,
-                                                &mut peers,
-                                                &limits,
-                                                &last_error,
-                                                parked,
-                                            );
-                                        // Refill the taken parked slot from
-                                        // the pool for the next park.
-                                        parked_slot = crate::sharded::acquire_buf()
-                                            .unwrap_or_else(|| vec![0u8; MAX_DATAGRAM]);
-                                    }
-                                    knet::RaceOutcome::Second(Ok(_)) => {
-                                        // Zero-length datagram (KCP never
-                                        // sends one) — drop and re-park.
-                                        continue;
-                                    }
-                                    knet::RaceOutcome::Second(Err(e)) => {
-                                        *last_error.lock() = Some(e);
-                                        knet::sleep_ms(10).await;
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-                        // Re-check after a park that may have raced shutdown.
-                        if closed.load(Ordering::Acquire) {
-                            break;
-                        }
-                    }
-
-                    if drained == 0 {
-                        continue;
-                    }
-
-                    process_batch(
-                        batch.drain(..),
-                        &worker,
-                        &socket,
-                        &config,
-                        &transport_wrapper,
-                        &limits,
-                        &pending,
-                        &accept_notify,
-                        &stats,
-                        &mut by_peer,
-                        &mut affected,
-                        &mut affected_seen,
-                        &mut deferred,
-                    )
-                    .await;
-
-                    // Adaptive yield: under high throughput with a lightweight
-                    // cipher (null/xor/none) each batch finishes in tens of µs.
-                    // An unconditional `yield_now()` per batch makes scheduler
-                    // overhead dominate the effective compute time. Instead we
-                    // process `WORKER_BATCHES_PER_YIELD` batches before
-                    // yielding, so back-to-back bursts amortize the scheduling
-                    // cost. The time-budget guard inside `process_batch`
-                    // (WORKER_TIME_BUDGET_US) still yields immediately for
-                    // heavy ciphers or large multi-peer bursts, so flush-loop
-                    // timers — retransmission deadlines, delayed ACKs, window
-                    // probes — are never starved.
-                    batches_since_yield = batches_since_yield.wrapping_add(1);
-                    if batches_since_yield >= WORKER_BATCHES_PER_YIELD {
-                        batches_since_yield = 0;
-                        knet::yield_now().await;
-                    }
-                }
-            });
-        })
-        .expect("spawn kcp-worker thread")
+    stats: Arc<ListenerStats>,
+    send_lock: Arc<SharedSendLock>,
+    config: KcpConfig,
+    transport_wrapper: Option<TransportWrapper>,
+    limits: WorkerPoolLimits,
+    /// Test hook: hold a finished build before publishing. See
+    /// [`KcpListenerBuilder::testing_build_delay`].
+    testing_build_delay: Duration,
 }
 
-/// Non-blocking `recvmmsg` drain of a direct worker's own socket into
-/// `batch` (§4 on the worker itself). `already` counts packets collected
-/// for this cycle; the call stops when the socket is dry (`WouldBlock`),
-/// a hard error is recorded, or the reader-pipeline quantum is consumed
-/// (`max_drain_packets` when set, else `DRAIN_QUANTUM`/`DRAIN_QUANTUM_MS`)
-/// so a flood cannot starve this shard's flush-loop timers. Consumed slots
-/// are refilled from the RX buffer pool. Returns packets added.
-fn drain_own_socket(
-    rx_socket: &Arc<knet::DatagramSocket>,
-    batch: &mut Vec<WorkerPacket>,
-    slots: &mut [Vec<u8>],
-    peers: &mut Vec<SocketAddr>,
-    limits: &WorkerPoolLimits,
-    last_error: &Arc<Mutex<Option<io::Error>>>,
-    already: usize,
-) -> usize {
-    let mut drained = already;
-    let drain_started = Instant::now();
-    loop {
-        let budget_left = if limits.max_drain_packets > 0 {
-            limits.max_drain_packets.saturating_sub(drained)
+fn spawn_rx(args: RxArgs) -> knet::JoinHandle<()> {
+    knet::spawn_task(async move {
+        let batch_cap = if args.limits.max_drain_packets > 0 {
+            args.limits.max_drain_packets
         } else {
-            usize::MAX
+            RECV_BATCH
         };
-        let recv_cap = slots.len().min(budget_left);
-        if recv_cap == 0 {
-            break;
-        }
-        // Ensure consumed slots carry full-MTU capacity again.
-        for slot in &mut slots[..recv_cap] {
-            if slot.capacity() < MAX_DATAGRAM {
-                *slot = crate::sharded::acquire_buf().unwrap_or_else(|| vec![0u8; MAX_DATAGRAM]);
-            }
-        }
-        let got = match rx_socket.try_recv_batch_from_into(&mut slots[..recv_cap], peers) {
-            Ok(got) => got,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(e) => {
-                *last_error.lock() = Some(e);
-                break;
-            }
+        let inbox_cap = if args.limits.worker_channel_cap > 0 {
+            args.limits.worker_channel_cap
+        } else {
+            SESSION_INBOX_CAP
         };
-        if got == 0 {
-            break;
-        }
-        for i in 0..got {
-            batch.push((peers[i], std::mem::take(&mut slots[i])));
-        }
-        drained += got;
-        if limits.max_drain_packets > 0 && drained >= limits.max_drain_packets {
-            break;
-        }
-        if drained >= DRAIN_QUANTUM || drain_started.elapsed().as_millis() >= DRAIN_QUANTUM_MS {
-            break;
-        }
-    }
-    drained - already
-}
+        let mut slot = vec![0u8; MAX_DATAGRAM];
+        let mut watched: Vec<(SocketAddr, u64)> = Vec::new();
+        // Reused across bursts: the datagram buffers themselves move into
+        // queues / KCP, so only the index vectors are cleared.
+        let mut burst: Vec<(SocketAddr, Vec<u8>)> = Vec::with_capacity(64);
+        let mut groups: Vec<(SocketAddr, Vec<Vec<u8>>)> = Vec::new();
+        let mut group_index: HashMap<SocketAddr, usize> = HashMap::new();
+        let mut last_sweep = Instant::now();
 
-/// Process one drained batch: single-peer fast path (existing session →
-/// `feed_raw_single`), or group by peer and run `process_session` per peer
-/// under the worker time budget. Shared by the drain path and the parked
-/// wake path (previously two duplicated ~70-line blocks).
-#[allow(clippy::too_many_arguments)]
-async fn process_batch(
-    batch: impl Iterator<Item = WorkerPacket>,
-    worker: &Arc<Worker>,
-    socket: &Arc<knet::DatagramSocket>,
-    config: &KcpConfig,
-    transport_wrapper: &Option<TransportWrapper>,
-    limits: &WorkerPoolLimits,
-    pending: &Arc<Mutex<VecDeque<PendingAccept>>>,
-    accept_notify: &Arc<Notify>,
-    stats: &Arc<WorkerStats>,
-    by_peer: &mut HashMap<SocketAddr, Vec<Vec<u8>>>,
-    affected: &mut Vec<SocketAddr>,
-    affected_seen: &mut HashSet<SocketAddr>,
-    deferred: &mut Vec<(SocketAddr, Vec<Vec<u8>>)>,
-) {
-    let packets: Vec<WorkerPacket> = batch.collect();
-    if packets.len() == 1 {
-        let (peer, data) = packets.into_iter().next().unwrap();
-        let existing = {
-            let sessions = worker.sessions.lock();
-            sessions.get(&peer).cloned()
-        };
-        if let Some(conn) = existing {
-            if conn.is_closed() || conn.is_dead() {
-                worker.sessions.lock().remove(&peer);
-                conn.close();
-            } else {
-                let before_mismatch = conn.conv_mismatch_count();
-                let before_restart = conn.peer_restart_count();
-                let _ = conn.feed_raw_single(data);
-                if stale_peer_signal(&conn, 1, before_mismatch, before_restart) {
-                    // Same stale-session case as the batch path.
-                    log::warn!(
-                        "listener: evicting stale session for {peer}: the peer re-dialed on the same address (this session belongs to the previous generation)"
-                    );
-                    worker.sessions.lock().remove(&peer);
-                    conn.close();
-                }
-            }
-        } else {
-            process_session(
-                worker,
-                &peer,
-                vec![data],
-                socket,
-                config,
-                transport_wrapper,
-                limits,
-                pending,
-                accept_notify,
-                stats,
+        loop {
+            // `close()` does not end this task. An accepted session still needs
+            // its peer's datagrams, and `deliver_group` refuses new peers once
+            // `closed` is set. The task ends when the listener is dropped,
+            // which cancels `stop`.
+            //
+            // No per-wakeup `yield_now` / `evict_stale` here: live sessions
+            // are fed inline in `process_burst`, so their stale counters are
+            // already up to date when that returns. Eviction then runs once
+            // per burst on the peers just watched.
+
+            slot.resize(MAX_DATAGRAM, 0);
+            // The timeout bounds a live listener so the idle sweep runs on a
+            // quiet socket. `stop` ends the task when the listener is dropped.
+            let first = knet::timeout(
+                SWEEP_INTERVAL,
+                knet::race(
+                    args.stop.cancelled(),
+                    std::pin::pin!(args.socket.recv_from(&mut slot)),
+                ),
             )
             .await;
-        }
-        return;
-    }
-
-    // Multi-peer: group by peer for batch KCP input.
-    by_peer.clear();
-    affected.clear();
-    affected_seen.clear();
-    for (peer, data) in packets {
-        if affected_seen.insert(peer) {
-            affected.push(peer);
-        }
-        by_peer.entry(peer).or_default().push(data);
-    }
-
-    // Process peers with a time budget: if we've spent too long on this
-    // batch, defer remaining peers (lossless carry-over) and yield.
-    let round_start = Instant::now();
-    let mut idx = 0;
-    while idx < affected.len() {
-        let peer = affected[idx];
-        let datagrams = by_peer.remove(&peer).unwrap_or_default();
-        process_session(
-            worker,
-            &peer,
-            datagrams,
-            socket,
-            config,
-            transport_wrapper,
-            limits,
-            pending,
-            accept_notify,
-            stats,
-        )
-        .await;
-        idx += 1;
-
-        if round_start.elapsed().as_micros() as u64 >= WORKER_TIME_BUDGET_US {
-            while idx < affected.len() {
-                let p = affected[idx];
-                if let Some(dgrams) = by_peer.remove(&p) {
-                    deferred.push((p, dgrams));
+            let (n, peer) = match first {
+                Ok(knet::RaceOutcome::First(())) => break,
+                Ok(knet::RaceOutcome::Second(Ok((n, peer)))) if n > 0 => (n, peer),
+                Ok(knet::RaceOutcome::Second(Ok(_))) => {
+                    sweep(&args);
+                    last_sweep = Instant::now();
+                    continue;
                 }
-                idx += 1;
+                Ok(knet::RaceOutcome::Second(Err(e))) => {
+                    *args.last_error.lock() = Some(e);
+                    knet::sleep_ms(10).await;
+                    continue;
+                }
+                Err(_) => {
+                    // Quiet for a whole sweep interval.
+                    sweep(&args);
+                    last_sweep = Instant::now();
+                    continue;
+                }
+            };
+
+            let mut buf = std::mem::take(&mut slot);
+            buf.truncate(n);
+            burst.push((peer, buf));
+
+            // The rest of the burst is already queued in the kernel. Drain it
+            // here so one peer's burst is grouped and fed to KCP as ONE batch —
+            // per-datagram feeding makes every datagram a one-packet burst,
+            // which both multiplies KCP locks and send syscalls and defeats
+            // the whole-burst stale-session guard.
+            while burst.len() < batch_cap {
+                let mut buf = acquire_buf().unwrap_or_else(|| Vec::with_capacity(MAX_DATAGRAM));
+                buf.resize(MAX_DATAGRAM, 0);
+                match args.socket.try_recv_from(&mut buf) {
+                    Ok((n, peer)) if n > 0 => {
+                        buf.truncate(n);
+                        burst.push((peer, buf));
+                    }
+                    Ok(_) => {
+                        recycle_buf(buf);
+                        break;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        recycle_buf(buf);
+                        break;
+                    }
+                    Err(e) => {
+                        *args.last_error.lock() = Some(e);
+                        recycle_buf(buf);
+                        break;
+                    }
+                }
             }
-            // Yield so other tasks (flush loops, acceptor) run.
-            knet::yield_now().await;
-            break;
+
+            process_burst(&args, &mut burst, &mut groups, &mut group_index, inbox_cap, &mut watched);
+            // `feed_raw_batch` updated every watched session's stale counter
+            // before returning, so the eviction check needs no yield.
+            if !watched.is_empty() {
+                evict_stale(&args, &mut watched);
+            }
+
+            // The sweep is O(sessions) and must not scale with packet rate:
+            // run it on its interval, not once per drained batch.
+            if last_sweep.elapsed() >= SWEEP_INTERVAL {
+                sweep(&args);
+                last_sweep = Instant::now();
+            }
         }
-    }
-    affected.clear();
+    })
 }
 
-/// Process one peer's batch of datagrams: build a new session if needed, then
-/// feed the batch via `feed_raw_batch` (§10.2: decrypt + KCP + encrypt on worker).
-///
-/// All shared state is passed as `Arc` clones so the build future has
-/// `'static` ownership.
-async fn process_session(
-    worker: &Arc<Worker>,
-    peer: &SocketAddr,
-    datagrams: Vec<Vec<u8>>,
-    socket: &Arc<knet::DatagramSocket>,
-    config: &KcpConfig,
-    transport_wrapper: &Option<TransportWrapper>,
-    limits: &WorkerPoolLimits,
-    pending: &Arc<Mutex<VecDeque<PendingAccept>>>,
-    accept_notify: &Arc<Notify>,
-    stats: &Arc<WorkerStats>,
+/// Group one drained burst by source address, preserving first-seen order, and
+/// hand each peer's datagrams to [`deliver_group`] as a unit. Per-peer grouping
+/// is what restores main's `feed_raw_batch` amortization — one KCP lock, one
+/// flush and one sendmmsg per peer per burst — and what keeps the whole-burst
+/// stale-session guard meaningful.
+fn process_burst(
+    args: &RxArgs,
+    burst: &mut Vec<(SocketAddr, Vec<u8>)>,
+    groups: &mut Vec<(SocketAddr, Vec<Vec<u8>>)>,
+    group_index: &mut HashMap<SocketAddr, usize>,
+    inbox_cap: usize,
+    watched: &mut Vec<(SocketAddr, u64)>,
 ) {
-    // Check if session exists — single lock for get-or-check.
-    let existing = {
-        let sessions = worker.sessions.lock();
-        sessions.get(peer).cloned()
-    };
-
-    if let Some(conn) = existing {
-        if conn.is_closed() || conn.is_dead() {
-            // Stale map entry: the session is already down but has not been
-            // reaped yet, so this peer's traffic belongs to a fresh dial.
-            worker.sessions.lock().remove(peer);
-            conn.close();
-        } else {
-            // Feed the batch while watching for conversation-ID mismatches.
-            // Datagrams that decrypt (so they are genuinely from this peer)
-            // but carry a different conv mean the peer re-dialed and reused
-            // its source port: this session is the stale one. Feeding it would
-            // swallow the new conversation indefinitely — the peer sees a link
-            // that is up but answers nothing, and closes it after 30s of
-            // "silence" that never happened on the wire.
-            let batch_len = datagrams.len() as u64;
-            let before_mismatch = conn.conv_mismatch_count();
-            let before_restart = conn.peer_restart_count();
-            let _ = conn.feed_raw_batch(datagrams);
-            if batch_len > 0 && stale_peer_signal(&conn, batch_len, before_mismatch, before_restart)
-            {
-                log::warn!(
-                    "listener: evicting stale session for {peer}: the peer re-dialed on the same address (this session belongs to the previous generation)"
-                );
-                worker.sessions.lock().remove(peer);
-                conn.close();
+    for (peer, buf) in burst.drain(..) {
+        match group_index.get(&peer) {
+            Some(&i) => groups[i].1.push(buf),
+            None => {
+                group_index.insert(peer, groups.len());
+                groups.push((peer, vec![buf]));
             }
-            return;
         }
     }
-
-    // No session — check if already building.
-    if worker.building.lock().contains_key(peer) {
-        // Queue datagrams for the in-progress build. They'll be fed once
-        // the build completes. For now, drop them — KCP retransmission
-        // recovers.
-        for d in datagrams {
-            recycle_buf(d);
-        }
-        return;
+    group_index.clear();
+    for (peer, datagrams) in groups.drain(..) {
+        deliver_group(args, peer, datagrams, inbox_cap, watched);
     }
-
-    // Admission check.
-    if limits.max_sessions_per_worker > 0
-        && worker.session_count() >= limits.max_sessions_per_worker
-    {
-        stats.session_drops.fetch_add(1, Ordering::Relaxed);
-        for d in datagrams {
-            recycle_buf(d);
-        }
-        return;
-    }
-
-    // Start building (staged, generation-guarded — §10.1).
-    let gen = worker.next_generation();
-    worker.building.lock().insert(*peer, (gen, Instant::now()));
-
-    // Build the KcpStream with background_input=false: the worker thread
-    // handles the full serial pipeline (decrypt → KCP → encrypt → send)
-    // via feed_raw_batch. No async input loop is spawned — zero scheduling
-    // overhead for the input path.
-    let peer_transport: Arc<dyn crate::transport::PacketTransport> =
-        Arc::new(crate::transport::PeerTransport {
-            queue: Arc::new(crate::transport::PeerQueue::new()),
-            socket: socket.clone(),
-            peer: *peer,
-        });
-    let transport = match transport_wrapper {
-        Some(wrapper) => wrapper(peer_transport, *peer),
-        None => peer_transport,
-    };
-
-    // Pre-admission integrity gate: decrypt the first burst *before* the
-    // session exists. One datagram from a spoofed source address used to be
-    // enough to allocate a KcpStream, a flush loop and an accept-backlog
-    // entry that the application then turns into a full SMUX session — all
-    // without proving knowledge of the key. `decrypt_packet_in_place`
-    // verifies the CRC32 (CFB) or the AEAD tag, so a peer that cannot
-    // produce one gets no state at all.
-    //
-    // With no crypto configured the transport's default `decrypt_packet_in_place`
-    // is the identity, so this is exactly the old behavior.
-    let mut datagrams = datagrams;
-    decrypt_batch_in_place(transport.as_ref(), &mut datagrams);
-    if datagrams.is_empty() {
-        worker.building.lock().remove(peer);
-        stats.unauthenticated_drops.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-
-    // `KcpStream::build()` spawns the flush loop for async send
-    // (WouldBlock fallback). The worker's event loop drives KCP
-    // maintenance (retransmit timers, delayed ACKs, probes) for sessions
-    // with due deadlines. `feed_batch` handles inline sync send via
-    // `drain_and_flush_tx` (fast path).
-    let conn = match KcpStream::with_transport(transport, *peer)
-        .connected(false)
-        .adopt_conv(true)
-        .background_input(false)
-        .config(config.clone())
-        .build()
-        .await
-    {
-        Ok(conn) => conn,
-        Err(_) => {
-            stats.build_failures.fetch_add(1, Ordering::Relaxed);
-            worker.building.lock().remove(peer);
-            for d in datagrams {
-                recycle_buf(d);
-            }
-            return;
-        }
-    };
-
-    // Register the session.
-    {
-        let mut sessions = worker.sessions.lock();
-        sessions.insert(*peer, conn.clone());
-    }
-    worker.building.lock().remove(peer);
-
-    // Push to accept backlog.
-    {
-        let mut p = pending.lock();
-        p.push_back(PendingAccept {
-            conn: conn.clone(),
-            peer: *peer,
-        });
-    }
-    accept_notify.notify_one();
-
-    // Feed the burst that opened the session. It was decrypted by the
-    // admission gate above, so this is `feed_batch`, not `feed_raw_batch`.
-    let mut conn = conn;
-    let _ = conn.feed_batch(datagrams);
-    // The build created this `KcpStream` as the owner. Clones were inserted
-    // into the session map and accept backlog. The original would close
-    // the connection on drop — detach ownership so the connection stays
-    // alive until the last clone drops.
-    conn.detach_owner();
 }
 
-/// Whether a burst proves the session in the map is a *previous generation* of
-/// this peer: every datagram belonged to another conversation (conv mismatch),
-/// or the whole burst started a new sequence space (peer restart).
+/// Push one peer's burst at its existing session, or start building one.
+fn deliver_group(
+    args: &RxArgs,
+    peer: SocketAddr,
+    datagrams: Vec<Vec<u8>>,
+    inbox_cap: usize,
+    watched: &mut Vec<(SocketAddr, u64)>,
+) {
+    // A peer whose session is being built is claimed even when its queue is
+    // full. Falling through would open a second session for the same address
+    // and split one handshake across two state machines.
+    if let Some((queue, _, _)) = args.building.lock().get(&peer).cloned() {
+        for buf in datagrams {
+            if !queue.push(buf, inbox_cap) {
+                args.stats.channel_drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        return;
+    }
+
+    // One `sessions` lock for lookup + optional reap. `close()` runs outside
+    // the guard: holding the map across it stalls every other peer's deliver.
+    enum Established {
+        Live(KcpStream),
+        Reaped(KcpStream),
+        None,
+    }
+    let established = {
+        let mut sessions = args.sessions.lock();
+        match sessions.get(&peer) {
+            Some(s) if !s.conn.is_closed() && !s.conn.is_dead() => {
+                Established::Live(s.conn.clone())
+            }
+            Some(_) => Established::Reaped(sessions.remove(&peer).unwrap().conn),
+            None => Established::None,
+        }
+    };
+    match established {
+        Established::Live(conn) => {
+            // Feed the whole group straight into KCP on this task and send the
+            // ACKs it produces before returning to the socket. Queueing it for
+            // the session's own input task costs a scheduling hop, and on a
+            // coarse timer wheel that hop measured 6–13ms — the whole of the
+            // fast-mode round trip. The count is taken first:
+            // `feed_raw_batch` updates it synchronously, and `evict_stale`
+            // compares against it once this burst has been delivered. The
+            // batch is the stale-session guard's unit: a group counts as a
+            // previous generation only when every datagram in it mismatched.
+            let before = conn.stale_burst_count();
+            if conn.feed_raw_batch(datagrams).is_err() {
+                args.stats.channel_drops.fetch_add(1, Ordering::Relaxed);
+            }
+            watched.push((peer, before));
+            return;
+        }
+        Established::Reaped(conn) => {
+            conn.close();
+            // Fall through: the group now counts as traffic from an unknown
+            // peer and may open a fresh session below.
+        }
+        Established::None => {}
+    }
+
+    // No session yet. A closed listener takes no new peers; datagrams for one
+    // already being built still go to its queue above.
+    if args.closed.load(Ordering::Acquire) {
+        for buf in datagrams {
+            recycle_buf(buf);
+        }
+        return;
+    }
+
+    // Admission is decided before any state is allocated.
+    if args.limits.max_sessions_per_worker > 0
+        && args.sessions.lock().len() >= args.limits.max_sessions_per_worker
+    {
+        args.stats.session_drops.fetch_add(1, Ordering::Relaxed);
+        for buf in datagrams {
+            recycle_buf(buf);
+        }
+        return;
+    }
+
+    // Integrity-gate a *copy* of the first datagram: one that fails the
+    // transport's CRC32 / AEAD check buys no state at all. The copy is
+    // discarded — the originals stay ciphertext and are what the queue
+    // receives, so the session input loop decrypts exactly once (decrypting
+    // here *and* there would drop the handshake burst).
+    let mut gate = vec![datagrams[0].clone()];
+    let queue = Arc::new(PeerQueue::new());
+    let transport = Arc::new(PeerTransport {
+        queue: queue.clone(),
+        socket: args.socket.clone(),
+        peer,
+        send_lock: Some(args.send_lock.clone()),
+    });
+    let transport: Arc<dyn crate::transport::PacketTransport> = match &args.transport_wrapper {
+        Some(wrapper) => wrapper(transport, peer),
+        None => transport,
+    };
+    decrypt_batch_in_place(transport.as_ref(), &mut gate);
+    if gate.is_empty() {
+        args.stats
+            .unauthenticated_drops
+            .fetch_add(1, Ordering::Relaxed);
+        for buf in datagrams {
+            recycle_buf(buf);
+        }
+        return;
+    }
+
+    // Build on its own task. `deliver_group` runs inside the receive task, and
+    // nesting a runtime there panics; the datagrams wait in the queue, which
+    // is registered before the spawn so the next datagram finds it.
+    let gen = args.build_gen.fetch_add(1, Ordering::Relaxed);
+    args.building
+        .lock()
+        .insert(peer, (queue.clone(), Instant::now(), gen));
+    for buf in datagrams {
+        if !queue.push(buf, inbox_cap) {
+            args.stats.channel_drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let sessions = args.sessions.clone();
+    let building = args.building.clone();
+    let pending = args.pending.clone();
+    let accept_notify = args.accept_notify.clone();
+    let closed = args.closed.clone();
+    let stats = args.stats.clone();
+    let config = args.config.clone();
+    let testing_build_delay = args.testing_build_delay;
+    knet::spawn_task(async move {
+        let conn = match KcpStream::with_transport(transport, peer)
+            .connected(false)
+            .adopt_conv(true)
+            .config(config)
+            .build()
+            .await
+        {
+            Ok(conn) => {
+                // Test hook: hold a *finished* build so `close()` can land
+                // before it is published. No-op in production.
+                if !testing_build_delay.is_zero() {
+                    knet::sleep_ms(testing_build_delay.as_millis() as u64).await;
+                }
+                conn
+            }
+            Err(_) => {
+                stats.build_failures.fetch_add(1, Ordering::Relaxed);
+                let mut b = building.lock();
+                if matches!(b.get(&peer), Some((_, _, g)) if *g == gen) {
+                    b.remove(&peer);
+                }
+                return;
+            }
+        };
+        // Publish only if this build still owns the `building` slot. A build
+        // that outlived `building_timeout` has been forgotten (and its queue
+        // closed) and may have been replaced by a fresh session — inserting
+        // unconditionally would overwrite that session and leak it. Hold the
+        // building lock across the insert so the reaper cannot drop the slot
+        // in between; `deliver` checks `building` first and both entries point
+        // at the same queue, so a datagram that lands in the gap still reaches
+        // this session.
+        {
+            let mut b = building.lock();
+            if !matches!(b.get(&peer), Some((_, _, g)) if *g == gen) {
+                drop(b);
+                conn.close();
+                return;
+            }
+            b.remove(&peer);
+            sessions
+                .lock()
+                .insert(peer, Session { conn: conn.clone() });
+            // close() drains `pending` and then sets nothing else, so a publish
+            // that loses the race removes the session it just inserted. The
+            // accept queue is taken after `sessions`: `discard_pending` drops
+            // `pending` before touching the map, so the two locks are never
+            // held together in opposite orders.
+            let mut waiting = pending.lock();
+            if closed.load(Ordering::Acquire) {
+                drop(waiting);
+                drop(b);
+                if let Some(session) = sessions.lock().remove(&peer) {
+                    session.conn.close();
+                }
+                return;
+            }
+            waiting.push_back(PendingAccept { conn, peer });
+        }
+        accept_notify.notify_one();
+    });
+}
+
+/// Evict sessions whose drained burst belonged entirely to a previous
+/// generation. Called right after [`process_burst`], which feeds live sessions
+/// inline and therefore updates their stale counters before returning.
 ///
-/// Both signals require an authentic datagram (the AEAD passed), so a spoofer
-/// cannot use them to evict a healthy session.
-fn stale_peer_signal(
-    conn: &KcpStream,
-    batch_len: u64,
-    before_mismatch: u64,
-    before_restart: u64,
-) -> bool {
-    conn.conv_mismatch_count().saturating_sub(before_mismatch) >= batch_len
-        || conn.peer_restart_count().saturating_sub(before_restart) >= batch_len
+/// The unit is the per-peer group fed by [`deliver_group`]:
+/// `process_inbound_batch` bumps `stale_bursts` once, and only when EVERY
+/// datagram of the group mismatched the session. A single stale datagram mixed
+/// into fresh traffic therefore never reaches this function's eviction —
+/// evicting on it would kill live sessions whose ACKs are being lost (the
+/// peer's `una` freezes at 0 and its RTO retransmits segment 0, which is
+/// indistinguishable from a re-dial until more traffic arrives).
+fn evict_stale(args: &RxArgs, watched: &mut Vec<(SocketAddr, u64)>) {
+    let observed = std::mem::take(watched);
+    let mut seen: HashMap<SocketAddr, u64> = HashMap::new();
+    for (peer, before) in observed {
+        let entry = seen.entry(peer).or_insert(u64::MAX);
+        *entry = (*entry).min(before);
+    }
+    for (peer, before) in seen {
+        let removed = {
+            let mut sessions = args.sessions.lock();
+            let Some(session) = sessions.get(&peer) else {
+                continue;
+            };
+            if session.conn.stale_burst_count() <= before {
+                continue;
+            }
+            sessions.remove(&peer)
+        };
+        if let Some(session) = removed {
+            log::warn!(
+                "listener: evicting stale session for {peer}: the peer re-dialed on the same address"
+            );
+            session.conn.close();
+        }
+    }
 }
 
 /// Decrypt a burst in place and drop every datagram that fails the transport's
-/// integrity check, compacting the survivors to the front. Mirrors the filter
-/// inside [`KcpStream::feed_raw_batch`], but usable before a session exists.
+/// integrity check, compacting the survivors to the front.
 fn decrypt_batch_in_place(
     transport: &dyn crate::transport::PacketTransport,
     datagrams: &mut Vec<Vec<u8>>,
@@ -1573,44 +991,47 @@ fn decrypt_batch_in_place(
     }
 }
 
-/// Lifecycle sweep: drop sessions the listener should no longer keep alive,
-/// and forget peers whose staged build never finished.
+/// Drop sessions the listener should no longer keep alive.
 ///
-/// A session is reaped when KCP declares the link dead (retransmission budget
-/// exhausted), when it is already closed, or when `limits.idle_timeout` has
-/// passed with no inbound datagram and no successful write. The idle rule is
-/// what bounds the map in practice: KCP has no keepalive, so a peer that sends
-/// one datagram and disappears never becomes `is_dead()` and would otherwise
-/// hold its slot (and its flush loop) forever.
-///
-/// Every reaped session is **closed**, not just dropped. The map holds a
-/// non-owning clone, so a bare `remove` leaks the flush-loop task and leaves
-/// anything blocked on the stream (the server's `session.accept()` loop)
-/// parked forever.
-///
-/// Bounded per call to avoid holding the sessions map lock while `is_dead()`
-/// takes the per-session KCP mutex.
-fn reaper_sweep(worker: &Worker, limits: &WorkerPoolLimits, stats: &WorkerStats) {
-    const MAX_SCAN: usize = 4096;
-    if limits.building_timeout > Duration::ZERO {
-        let mut building = worker.building.lock();
-        building.retain(|_, (_, started)| started.elapsed() < limits.building_timeout);
-    }
-    // Collect live session refs under the lock, then drop it before
-    // calling is_dead() (which takes the KCP mutex).
+/// A session is reaped when KCP declares the link dead, when it is already
+/// closed, or when `limits.idle_timeout` has passed with no inbound datagram
+/// and no successful write. Every reaped session is closed, not just dropped:
+/// the map holds a non-owning clone, so a bare `remove` leaves the flush loop
+/// running.
+fn sweep(args: &RxArgs) {
+    // Scan the whole map. The lock is only held to clone the session handles;
+    // `is_dead()` runs after it is dropped. Capping the scan (the old 4096)
+    // starved anything past that prefix: `HashMap` iteration order is bucket
+    // order, so the same entries came first on every pass until one of them
+    // was removed, and a closed session behind them was never reaped.
     let candidates: Vec<(SocketAddr, KcpStream)> = {
-        let sessions = worker.sessions.lock();
-        sessions
-            .iter()
-            .take(MAX_SCAN)
-            .map(|(p, c)| (*p, c.clone()))
-            .collect()
+        let sessions = args.sessions.lock();
+        sessions.iter().map(|(p, s)| (*p, s.conn.clone())).collect()
     };
+    if args.limits.building_timeout > Duration::ZERO {
+        // Close the queue of a build that never finished. Otherwise it stays
+        // open with whatever handshake datagrams it held, and nothing drains it.
+        let abandoned: Vec<Arc<crate::transport::PeerQueue>> = {
+            let mut building = args.building.lock();
+            let expired: Vec<SocketAddr> = building
+                .iter()
+                .filter(|(_, (_, started, _))| started.elapsed() >= args.limits.building_timeout)
+                .map(|(peer, _)| *peer)
+                .collect();
+            expired
+                .iter()
+                .filter_map(|peer| building.remove(peer).map(|(queue, _, _)| queue))
+                .collect()
+        };
+        for queue in abandoned {
+            queue.mark_closed();
+        }
+    }
     if candidates.is_empty() {
         return;
     }
     let now = knet::mono_ms();
-    let idle_ms = limits.idle_timeout.as_millis() as u64;
+    let idle_ms = args.limits.idle_timeout.as_millis() as u64;
     let mut dead: Vec<SocketAddr> = Vec::new();
     let mut idle = 0u64;
     for (peer, conn) in candidates {
@@ -1624,349 +1045,14 @@ fn reaper_sweep(worker: &Worker, limits: &WorkerPoolLimits, stats: &WorkerStats)
     if dead.is_empty() {
         return;
     }
-    let evicted: Vec<KcpStream> = {
-        let mut sessions = worker.sessions.lock();
+    let evicted: Vec<Session> = {
+        let mut sessions = args.sessions.lock();
         dead.iter().filter_map(|p| sessions.remove(p)).collect()
     };
-    // Close outside the map lock: `close()` wakes readers/writers, and their
-    // wakers must not run with the shard's session map held.
-    for conn in evicted {
-        conn.close();
+    for session in evicted {
+        session.conn.close();
     }
     if idle > 0 {
-        stats.idle_reaps.fetch_add(idle, Ordering::Relaxed);
-    }
-}
-
-// ─── Tests ───────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bytes::Bytes;
-    use knet::AsyncReadExt;
-
-    /// Transport wrapper whose integrity check rejects every datagram — what
-    /// `CryptoTransport` does for a peer that cannot produce a valid CRC32 /
-    /// AEAD tag.
-    struct RejectAll(Arc<dyn crate::transport::PacketTransport>);
-
-    #[async_trait::async_trait]
-    impl crate::transport::PacketTransport for RejectAll {
-        async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-            self.0.recv(buf).await
-        }
-        fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-            self.0.try_recv(buf)
-        }
-        fn decrypt_packet_in_place(&self, _buf: &mut [u8], _n: usize) -> usize {
-            0
-        }
-        async fn send_batch(&self, packets: &[Bytes]) -> io::Result<()> {
-            self.0.send_batch(packets).await
-        }
-        async fn send_batch_to(&self, packets: &[Bytes], target: SocketAddr) -> io::Result<()> {
-            self.0.send_batch_to(packets, target).await
-        }
-        fn try_send_batch(&self, packets: &[Bytes]) -> io::Result<usize> {
-            self.0.try_send_batch(packets)
-        }
-        fn local_addr(&self) -> io::Result<SocketAddr> {
-            self.0.local_addr()
-        }
-    }
-
-    /// One datagram from an unknown peer must not buy any server state until
-    /// it passes the transport's integrity check. Before the admission gate a
-    /// spoofed source address allocated a `KcpStream`, a flush loop and an
-    /// accept-backlog entry that the application turned into a full session.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn unauthenticated_datagram_creates_no_session() {
-        let listener = KcpListener::bind("127.0.0.1:0")
-            .worker_count(1)
-            .transport_wrapper(|inner, _peer| Arc::new(RejectAll(inner)))
-            .build()
-            .await
-            .unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let attacker = knet::UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
-        for _ in 0..8 {
-            attacker.send_to(&[0u8; 64], addr).await.unwrap();
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        assert_eq!(listener.session_count(), 0, "spoofed peer got a session");
-        assert!(listener.try_accept().unwrap().is_none());
-        assert!(
-            listener.stats().unauthenticated_drops > 0,
-            "admission gate did not record the drop"
-        );
-        listener.close();
-    }
-
-    /// `max_sessions_per_worker` must actually refuse new peers once reached.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn session_cap_refuses_additional_peers() {
-        let listener = KcpListener::bind("127.0.0.1:0")
-            .worker_count(1)
-            .limits(WorkerPoolLimits {
-                max_sessions_per_worker: 1,
-                ..Default::default()
-            })
-            .build()
-            .await
-            .unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        // No crypto configured, so the admission gate is the identity and any
-        // datagram opens a session — exactly the pre-fix behavior, which is
-        // what the cap has to bound.
-        for _ in 0..2 {
-            let peer = knet::UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
-            peer.send_to(&[0u8; 64], addr).await.unwrap();
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
-
-        assert_eq!(listener.session_count(), 1, "cap was not enforced");
-        assert!(listener.stats().session_drops > 0);
-        listener.close();
-    }
-
-    /// A peer that sends one datagram and vanishes never trips `is_dead()`
-    /// (KCP has no keepalive and the session has nothing to retransmit), so
-    /// the idle timeout is the only thing that frees its slot. The reaper must
-    /// also `close()` what it removes: the map holds the last clone, and a
-    /// bare `remove` leaves the flush loop running and the application's
-    /// `accept()` loop parked forever.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn idle_sessions_are_closed_and_reaped() {
-        let listener = KcpListener::bind("127.0.0.1:0")
-            .worker_count(1)
-            .limits(WorkerPoolLimits {
-                idle_timeout: Duration::from_millis(50),
-                ..Default::default()
-            })
-            .build()
-            .await
-            .unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let peer = knet::UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
-        peer.send_to(&[0u8; 64], addr).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(listener.session_count(), 1, "session was never created");
-        let (conn, _) = listener
-            .try_accept()
-            .unwrap()
-            .expect("no accept backlog entry");
-        assert!(!conn.is_closed());
-
-        // The sweeper runs on a SWEEP_PARK_MS timer; allow two cycles.
-        tokio::time::sleep(Duration::from_millis(2 * SWEEP_PARK_MS + 500)).await;
-
-        assert_eq!(listener.session_count(), 0, "idle session was not reaped");
-        assert!(
-            conn.is_closed(),
-            "reaped session was dropped without close()"
-        );
-        assert!(listener.stats().idle_reaps > 0);
-        listener.close();
-    }
-
-    /// `remove_peer` is the application's teardown hook (kcptun-server calls it
-    /// when a session's stream loop ends); it must close, not just unmap.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn remove_peer_closes_the_session() {
-        let listener = KcpListener::bind("127.0.0.1:0")
-            .worker_count(1)
-            .build()
-            .await
-            .unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let peer = knet::UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
-        peer.send_to(&[0u8; 64], addr).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let (conn, peer_addr) = listener
-            .try_accept()
-            .unwrap()
-            .expect("no accept backlog entry");
-        assert!(!conn.is_closed());
-
-        assert!(listener.remove_peer(peer_addr));
-        assert!(conn.is_closed());
-        listener.close();
-    }
-
-    /// `fast_hash_peer` must be deterministic and stable for the same address.
-    #[test]
-    fn hash_is_stable() {
-        let a = SocketAddr::from(([127, 0, 0, 1], 8080));
-        assert_eq!(fast_hash_peer(&a), fast_hash_peer(&a));
-    }
-
-    /// Different addresses hash to different values (sanity).
-    #[test]
-    fn hash_distinguishes_peers() {
-        let a = SocketAddr::from(([127, 0, 0, 1], 8080));
-        let b = SocketAddr::from(([127, 0, 0, 1], 8081));
-        assert_ne!(fast_hash_peer(&a), fast_hash_peer(&b));
-    }
-
-    /// Worker channel routing: same peer → same worker.
-    #[test]
-    fn session_affinity_routes_same_peer_to_same_worker() {
-        let n = 4;
-        let peer = SocketAddr::from(([192, 168, 1, 100], 12345));
-        let shard = (fast_hash_peer(&peer) as usize) % n;
-        for _ in 0..100 {
-            assert_eq!((fast_hash_peer(&peer) as usize) % n, shard);
-        }
-    }
-
-    /// `WorkerPoolLimits::default` bounds sessions and reaps idle ones. A
-    /// server session is created from one inbound datagram, so "unlimited" was
-    /// a remote memory-exhaustion primitive.
-    #[test]
-    fn default_limits_are_bounded() {
-        let l = WorkerPoolLimits::default();
-        assert_eq!(l.max_sessions_per_worker, DEFAULT_MAX_SESSIONS_PER_WORKER);
-        assert!(l.max_sessions_per_worker > 0);
-        assert!(l.idle_timeout > Duration::ZERO);
-        assert!(l.building_timeout > Duration::ZERO);
-        assert_eq!(l.worker_channel_cap, WORKER_CHANNEL_CAP);
-    }
-
-    /// End-to-end: bind, connect, echo, accept.
-    ///
-    /// Uses `#[tokio::test]` directly so the test future and spawned tasks
-    /// share the same tokio runtime.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sharded_listener_accept() {
-        let listener = KcpListener::bind("127.0.0.1:0")
-            .worker_count(2)
-            .mtu(1350)
-            .sndwnd(128)
-            .rcvwnd(128)
-            .build()
-            .await
-            .unwrap();
-        assert_eq!(listener.worker_count(), 2);
-        let addr = listener.local_addr().unwrap();
-
-        // Connect a client — this creates a KCP connection with a flush
-        // loop that will send probes/data.
-        let client = KcpStream::connect(addr)
-            .mtu(1350)
-            .sndwnd(128)
-            .rcvwnd(128)
-            .build()
-            .await
-            .unwrap();
-
-        // Write data to trigger KCP traffic.
-        let msg = b"hello sharded world!";
-        client.write_all(msg).await.unwrap();
-
-        // Give the reader + worker time to process.
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-        // Wait for the listener to accept (with timeout).
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await;
-
-        assert!(result.is_ok(), "accept timed out");
-        let (conn, _peer) = result.unwrap().unwrap();
-        drop(conn);
-    }
-
-    /// End-to-end through the **direct** worker (worker_count == 1): the
-    /// worker drains the socket itself, so this exercises the
-    /// `recv_from`-parked event loop, socket-driven session build, and
-    /// echo via `feed_raw_batch`. Cross-platform — on every OS a fresh
-    /// single-worker bind takes the direct topology.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn direct_worker_echo() {
-        let listener = Arc::new(
-            KcpListener::bind("127.0.0.1:0")
-                .worker_count(1)
-                .mtu(1350)
-                .sndwnd(128)
-                .rcvwnd(128)
-                .build()
-                .await
-                .unwrap(),
-        );
-        assert_eq!(listener.worker_count(), 1);
-        let addr = listener.local_addr().unwrap();
-
-        // Echo off the accepted session inside the test runtime.
-        let echo_listener = listener.clone();
-        let echo = knet::spawn_task(async move {
-            let (conn, _peer) = echo_listener.accept().await.unwrap();
-            let mut buf = vec![0u8; 2048];
-            loop {
-                match conn.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if conn.write_all(&buf[..n]).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-
-        let mut client = KcpStream::connect(addr)
-            .mtu(1350)
-            .sndwnd(128)
-            .rcvwnd(128)
-            .build()
-            .await
-            .unwrap();
-
-        // Several rounds to cross park/wake boundaries on the direct worker.
-        for round in 0..4u32 {
-            let msg = format!("direct echo round {round}");
-            client.write_all(msg.as_bytes()).await.unwrap();
-            let mut rx = vec![0u8; msg.len()];
-            tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                client.read_exact(&mut rx),
-            )
-            .await
-            .expect("echo reply timed out")
-            .expect("read failed");
-            assert_eq!(rx, msg.as_bytes());
-        }
-
-        client.close();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), echo).await;
-        listener.close();
-    }
-
-    /// Direct worker parked in `recv_from` must be woken by `close()`
-    /// (cancel token race) rather than waiting for traffic. On a
-    /// single-worker direct listener with no traffic, `close()` unblocks
-    /// shutdown promptly.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn close_wakes_direct_worker() {
-        let listener = KcpListener::bind("127.0.0.1:0")
-            .worker_count(1)
-            .build()
-            .await
-            .unwrap();
-        assert_eq!(listener.worker_count(), 1);
-        listener.close();
-
-        // If the cancel race were broken, the worker would stay parked; the
-        // thread would only exit when the runtime drops. Give it a moment —
-        // there is no direct handle to the worker thread, so assert the
-        // listener-level close semantics instead: close is idempotent and
-        // accept reports shutdown.
-        listener.close();
-        let res = listener.accept().await;
-        assert!(res.is_err(), "accept must fail after close");
+        args.stats.idle_reaps.fetch_add(idle, Ordering::Relaxed);
     }
 }

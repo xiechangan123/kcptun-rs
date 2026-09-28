@@ -895,6 +895,56 @@ impl KCP {
         }
     }
 
+    /// Emit queued ACKs and nothing else.
+    ///
+    /// [`flush_with_current`](Self::flush_with_current) also walks the whole send
+    /// buffer for retransmissions. An ACK-only burst does not need that: one
+    /// datagram holds `mtu / 24` ACKs (about 56 at the default MTU) and costs a
+    /// single `sendmmsg`, around a microsecond. Holding a short `acklist` for
+    /// the 10ms maintenance tick instead costs 10ms per round trip, which is
+    /// what a one-packet exchange measures.
+    ///
+    /// A full datagram's worth of ACKs is already flushed by
+    /// [`flush_if_pending`](Self::flush_if_pending) (the input path sets
+    /// `pending_flush` once `acklist` reaches `mtu / 24`). This sends whatever
+    /// is left over, so a burst that did not fill a datagram still leaves
+    /// immediately.
+    pub fn flush_acks_only(&mut self) {
+        if self.acklist.is_empty() {
+            return;
+        }
+        let mtu = self.mtu as usize;
+        let rcv_nxt = self.rcv_nxt;
+        let acks: Vec<(u32, u32)> = self
+            .acklist
+            .iter()
+            .enumerate()
+            .filter(|(i, entry)| itimediff(entry.sn, rcv_nxt) >= 0 || *i + 1 == self.acklist.len())
+            .map(|(_, entry)| (entry.sn, entry.ts))
+            .collect();
+        self.acklist.clear();
+
+        self.ack_seg.conv = self.conv;
+        self.ack_seg.cmd = Command::Ack as u8;
+        self.ack_seg.wnd = self.wnd_unused();
+        self.ack_seg.una = rcv_nxt;
+        self.ack_seg.len = 0;
+        for (sn, ts) in acks {
+            if self.buffer.len() + crate::segment::KCP_OVERHEAD > mtu && !self.buffer.is_empty()
+            {
+                let data = self.buffer.copy_to_bytes(self.buffer.len());
+                (self.output)(data);
+            }
+            self.ack_seg.sn = sn;
+            self.ack_seg.ts = ts;
+            Segment::encode(&self.ack_seg, &mut self.buffer);
+        }
+        if !self.buffer.is_empty() {
+            let data = self.buffer.copy_to_bytes(self.buffer.len());
+            (self.output)(data);
+        }
+    }
+
     /// Backward-compatible single-datagram input: process then flush
     /// immediately (matches Go `kcp.Input` + `flush(true)` semantics for
     /// callers that don't batch).

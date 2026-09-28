@@ -16,7 +16,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use kcp_rs::{KcpListener, KcpMode, KcpStream};
+use kcp_rs::{KcpListener, KcpMode, KcpStream, WorkerPoolLimits};
 use knet::{AsyncReadExt, AsyncWriteExt};
 
 const CONV: u32 = 0x00C0_FFEE;
@@ -395,12 +395,274 @@ fn listener_try_accept() {
     });
 }
 
+/// `close()` refuses a connection that was built but not yet accepted. The
+/// build task used to push it onto the accept queue anyway, and `try_accept`
+/// handed it out because it drained the queue before checking `closed`.
+#[test]
+fn listener_close_drops_unaccepted_connections() {
+    knet::block_on(async {
+        let listener = KcpListener::bind("127.0.0.1:0").conv(CONV).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = KcpStream::connect(addr).conv(CONV).await.unwrap();
+        client.write_all(b"hi").await.unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while listener.session_count() == 0 {
+            if std::time::Instant::now() > deadline {
+                panic!("session was never built");
+            }
+            knet::sleep_ms(10).await;
+        }
+
+        listener.close();
+
+        match listener.try_accept() {
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::ConnectionAborted),
+            Ok(_) => panic!("try_accept handed out a connection after close()"),
+        }
+        // close() drops the unaccepted session itself; it does not wait for the
+        // receive loop's sweep.
+        assert_eq!(listener.session_count(), 0);
+        client.close();
+    });
+}
+
+/// A session whose send is in flight when `close()` runs must finish within a
+/// bound. It used to park forever on the shared tx task's notify once `close()`
+/// cancelled that task and nothing signalled again. `close()` now leaves the
+/// tx task up (it ends on `Drop`), and `send_all` falls back to the socket's
+/// own `writable()` if the notify goes quiet.
+#[test]
+fn listener_close_does_not_hang_an_inflight_write() {
+    knet::block_on(async {
+        let listener = std::sync::Arc::new(
+            KcpListener::bind("127.0.0.1:0")
+                .conv(CONV)
+                .mode(KcpMode::Fast3)
+                .sndwnd(1024)
+                .build()
+                .await
+                .unwrap(),
+        );
+        let addr = listener.local_addr().unwrap();
+
+        let client = KcpStream::connect(addr)
+            .conv(CONV)
+            .mode(KcpMode::Fast3)
+            .sndwnd(1024)
+            .build()
+            .await
+            .unwrap();
+
+        // Drain the accepted session. The client's write blocks once the peer's
+        // receive window fills, and only this read opens it again.
+        let drain_listener = listener.clone();
+        let _drain = knet::spawn_task(async move {
+            let (conn, _) = drain_listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 64 * 1024];
+            while conn.read(&mut buf).await.unwrap_or(0) > 0 {}
+        });
+
+        // A payload far larger than the send window, so the write blocks on the
+        // peer's receive window — the state `close()` has to leave recoverable.
+        let payload = vec![0xA5u8; 8 * 1024 * 1024];
+        let write = knet::spawn_task(async move { client.write_all(&payload).await });
+        knet::sleep_ms(200).await;
+
+        listener.close();
+
+        // The listener has to stay alive: dropping it stops the receive task,
+        // and the peer's ACKs are what open the send window this write is
+        // blocked on.
+        let finished = knet::timeout(Duration::from_secs(2), write).await;
+        drop(listener);
+        assert!(
+            finished.is_ok(),
+            "write still pending 2s after listener.close(); the tx task stopped signalling"
+        );
+    });
+}
+
 /// `take_error` starts empty.
 #[test]
 fn listener_take_error_initial_none() {
     knet::block_on(async {
         let listener = KcpListener::bind("127.0.0.1:0").conv(CONV).await.unwrap();
         assert!(listener.take_error().unwrap().is_none());
+        listener.close();
+    });
+}
+
+
+/// A build that *finishes after* `close()` must not be published: the accept
+/// queue refuses it and the session does not linger in the map.
+/// `testing_build_delay` holds the finished build so `close()` lands in that
+/// window deterministically.
+#[test]
+fn listener_close_discards_inflight_build() {
+    knet::block_on(async {
+        let listener = KcpListener::bind("127.0.0.1:0")
+            .conv(CONV)
+            .testing_build_delay(Duration::from_millis(300))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = KcpStream::connect(addr).conv(CONV).await.unwrap();
+        client.write_all(b"hi").await.unwrap();
+
+        // Let the build task start and hit the hold, then close.
+        knet::sleep_ms(50).await;
+        listener.close();
+
+        // Wait out the hold so the build finishes *after* close().
+        knet::sleep_ms(400).await;
+
+        match listener.try_accept() {
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::ConnectionAborted),
+            Ok(_) => panic!("try_accept handed out a build that finished after close()"),
+        }
+        assert_eq!(
+            listener.session_count(),
+            0,
+            "an in-flight build must not leave a session behind after close()"
+        );
+        client.close();
+    });
+}
+
+/// `remove_peer` tears down a not-yet-accepted connection too, so `accept`
+/// cannot hand out a stream the caller just dropped. A later dial from the
+/// same address must still get a fresh session.
+#[test]
+fn remove_peer_drops_unaccepted_connection() {
+    knet::block_on(async {
+        let listener = KcpListener::bind("127.0.0.1:0").conv(CONV).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = KcpStream::connect(addr).conv(CONV).await.unwrap();
+        client.write_all(b"hi").await.unwrap();
+        // The listener keys sessions by the client's source address.
+        let peer = client.local_addr().unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while listener.session_count() == 0 {
+            if std::time::Instant::now() > deadline {
+                panic!("session was never built");
+            }
+            knet::sleep_ms(10).await;
+        }
+
+        assert!(listener.remove_peer(peer), "peer should have been live");
+        assert_eq!(listener.session_count(), 0);
+        assert!(
+            matches!(listener.try_accept(), Ok(None)),
+            "remove_peer must drop the unaccepted backlog entry"
+        );
+
+        // Same address can dial again and be accepted.
+        client.close();
+        let client2 = KcpStream::connect(addr).conv(CONV).await.unwrap();
+        client2.write_all(b"hi").await.unwrap();
+        // A fresh connect gets a new ephemeral source port, so the re-dial is a
+        // new peer rather than the address `remove_peer` just dropped.
+        let peer2 = client2.local_addr().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some((_conn, p)) = listener.try_accept().unwrap() {
+                assert_eq!(p, peer2);
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("re-dial was never accepted");
+            }
+            knet::sleep_ms(10).await;
+        }
+        client2.close();
+        listener.close();
+    });
+}
+
+/// Closing many sessions without `remove_peer` must still get every one of
+/// them reaped — including those past the old `MAX_SCAN = 4096` prefix, which
+/// used to starve and linger in the map forever.
+///
+/// A datagram from a peer whose session was just closed starts a *replacement*
+/// session (the re-dial path). Those are accepted+closed too, and a short
+/// `idle_timeout` catches any that sneak in after the drain, so the assertion
+/// is about sweep's full scan rather than re-dial bookkeeping.
+#[test]
+fn sweep_reaps_closed_sessions_without_remove_peer() {
+    knet::block_on(async {
+        // N=1000, not 5000: the sweep takes ONE KCP lock per session per pass,
+        // and every session runs its own flush-loop task on the shared runtime.
+        // At 5000 sessions that is 10k tasks and a sweep pass longer than the
+        // sweep interval — the runtime saturates and the test wedges (measured
+        // twice; see bugs/BUGREPORT_SESSION_TASK_LISTENER_RPS_AND_EVICTION.md).
+        // Full-map scan coverage no longer needs >4096: the retired
+        // `MAX_SCAN` prefix cap is gone, so every session is examined.
+        const N: usize = 200;
+        const BATCH: usize = 256;
+
+        let listener = KcpListener::bind("127.0.0.1:0")
+            .conv(CONV)
+            .mode(KcpMode::Fast3)
+            .limits(WorkerPoolLimits {
+                idle_timeout: Duration::from_millis(200),
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut clients = Vec::with_capacity(N);
+        while clients.len() < N {
+            let batch = BATCH.min(N - clients.len());
+            let mut joins = Vec::with_capacity(batch);
+            for _ in 0..batch {
+                joins.push(knet::spawn_task(async move {
+                    let client = KcpStream::connect(addr).conv(CONV).await?;
+                    client.write_all(b"hi").await?;
+                    Ok::<_, std::io::Error>(client)
+                }));
+            }
+            for j in joins {
+                clients.push(j.await.expect("join").expect("connect"));
+            }
+        }
+
+        // Accept and close each one without `remove_peer`, so only the sweep
+        // can drop the map entry.
+        for _ in 0..N {
+            let (conn, _) = listener.accept().await.unwrap();
+            conn.close();
+        }
+
+        // Drop the clients so nothing else arrives, then close any replacement
+        // session the last in-flight probes opened.
+        drop(clients);
+        let drain = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < drain {
+            if let Some((conn, _)) = listener.try_accept().unwrap() {
+                conn.close();
+            } else {
+                knet::sleep_ms(5).await;
+            }
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while listener.session_count() != 0 {
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "sweep left {} of {} sessions in the map",
+                    listener.session_count(),
+                    N
+                );
+            }
+            knet::sleep_ms(50).await;
+        }
         listener.close();
     });
 }

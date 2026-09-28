@@ -69,6 +69,13 @@ impl UdpSocket {
         self.inner.send(buf).await
     }
 
+    /// Wait until a send can proceed. Wakes every waiter, so a shared socket
+    /// should have exactly one task parked here.
+    #[inline(always)]
+    pub async fn writable(&self) -> io::Result<()> {
+        self.inner.writable().await
+    }
+
     #[inline(always)]
     pub async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
         self.inner.send_to(buf, target).await

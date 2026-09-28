@@ -178,6 +178,17 @@ impl DatagramSocket {
         }
     }
 
+    /// Wait until the socket can accept another send. Shared by every session
+    /// of a listener, so callers that find the kernel buffer full park here
+    /// instead of polling. A raw-TCP transport has no readiness signal and
+    /// returns immediately.
+    pub async fn writable(&self) -> io::Result<()> {
+        match self {
+            Self::Udp(s) => s.writable().await,
+            Self::TcpRaw(_) => Ok(()),
+        }
+    }
+
     pub fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         match self {
             Self::Udp(s) => s.try_recv_from(buf),

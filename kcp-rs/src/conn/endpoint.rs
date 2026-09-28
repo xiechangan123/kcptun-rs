@@ -99,6 +99,11 @@ pub(crate) struct SharedIoState {
     /// reused its source port, so the listener evicts this stale session
     /// instead of feeding the new conversation into it.
     pub(crate) peer_restart: AtomicU64,
+    /// Bursts whose every datagram belonged to a previous generation of the
+    /// peer (conv mismatch or sequence restart). One stale datagram inside a
+    /// burst of fresh data does not count: a late retransmission must not
+    /// evict a live session.
+    pub(crate) stale_bursts: AtomicU64,
     /// When false, no background input-loop task is spawned: an external
     /// driver (the listener worker pipeline) feeds inbound via
     /// [`KcpStream::feed_raw_batch`].
@@ -340,16 +345,67 @@ impl SharedIoState {
         }
     }
 
-    /// Synchronous drain-and-flush for the external-worker event loop
-    /// (`background_input=false` + `feed_batch`). Drains `raw_packets` and
-    /// flushes them via non-blocking `try_send_batch` / `try_send_batch_to`,
-    /// **without** an `.await` — the caller is a sync worker event loop
-    /// (pipeline §14: `drain_udp_batch` + `flush_ready_sessions`).
+    /// Decrypt a whole peer burst, run it through KCP, and send the ACKs it
+    /// produced, all before returning. The listener's receive task calls this
+    /// with every datagram one peer sent between two receive wakeups, so a
+    /// burst costs ONE KCP lock acquisition, ONE flush and ONE sendmmsg — the
+    /// amortization main's worker pipeline had. The burst is also the
+    /// stale-session guard's unit: [`process_inbound_batch`] counts it as a
+    /// previous generation only when every datagram in it mismatched, so a
+    /// single late retransmission never evicts a live session.
+    pub(crate) fn feed_raw_batch(self: &Arc<Self>, mut datagrams: Vec<Vec<u8>>) -> io::Result<()> {
+        if self.is_closed() {
+            for d in datagrams {
+                crate::sharded::recycle_buf(d);
+            }
+            return Ok(());
+        }
+        // Decrypt in place and compact the survivors to the front; a datagram
+        // that fails the transport's integrity check is recycled, not parsed.
+        let mut write = 0usize;
+        for read in 0..datagrams.len() {
+            let n = datagrams[read].len();
+            let pn = self.transport.decrypt_packet_in_place(&mut datagrams[read], n);
+            if pn > 0 {
+                datagrams[read].truncate(pn);
+                if write != read {
+                    datagrams.swap(write, read);
+                }
+                write += 1;
+            }
+        }
+        for d in datagrams.drain(write..) {
+            crate::sharded::recycle_buf(d);
+        }
+        if datagrams.is_empty() {
+            return Ok(());
+        }
+        self.mark_activity();
+        let (data_ready, protocol_pending) = process_inbound_batch(self, &datagrams);
+        if data_ready {
+            self.wake_reader();
+        }
+        if !self.drain_and_flush_tx() || protocol_pending {
+            self.flush_notify.notify_one();
+        }
+        for d in datagrams {
+            crate::sharded::recycle_buf(d);
+        }
+        Ok(())
+    }
+
+    /// Synchronous drain-and-flush. Used by the listener's inline
+    /// `feed_raw_batch` so an ACK burst leaves before the receive task returns
+    /// to the socket, and by the tests that hand a partial batch to
+    /// `spawn_send_remainder`.
+    ///
+    /// Drains `raw_packets` and flushes them via non-blocking
+    /// `try_send_batch` / `try_send_batch_to`, **without** an `.await`.
     ///
     /// On a partial send or `WouldBlock`, ownership moves to a short async
     /// continuation which sends only the remaining wire suffix while retaining
     /// the single-sender token. This preserves FIFO order without blocking the
-    /// synchronous worker event loop.
+    /// caller.
     ///
     /// Returns `true` if the send token was acquired (caller should NOT
     /// notify the flush loop for the immediate burst). Returns `false` if
@@ -946,6 +1002,8 @@ pub(crate) fn spawn_input_loop(shared: Arc<SharedIoState>) -> knet::JoinHandle<(
 ///
 /// Returns `(data_ready, protocol_pending)` for reader and maintenance wakes.
 pub(crate) fn process_inbound_batch(shared: &SharedIoState, datagrams: &[Vec<u8>]) -> (bool, bool) {
+    let mismatch_before = shared.conv_mismatch.load(Ordering::Relaxed);
+    let restart_before = shared.peer_restart.load(Ordering::Relaxed);
     // ── Phase 1: FEC decode all datagrams OUTSIDE the KCP lock ──
     // For non-FEC mode, datagrams are fed directly in Phase 2 (no clone).
     // For FEC mode, original data shards stay borrowed. Only reconstructed
@@ -1021,8 +1079,24 @@ pub(crate) fn process_inbound_batch(shared: &SharedIoState, datagrams: &[Vec<u8>
         // `input_no_flush` records whether ACKs/data need a flush. This keeps
         // the default ack-no-delay=true behavior immediate while avoiding a
         // sticky unconditional flush for every inbound burst.
+        //
+        // With acknodelay off the ACKs stay in `acklist` and nothing sets
+        // `pending_flush`, so the only thing that would emit them is the flush
+        // loop's next scheduled pass. That pass arms its deadline from
+        // `interval` (clamped to 10ms), so every ACK waited out a timer tick
+        // and a fast-mode exchange measured ~9ms. Emit them with this burst
+        // instead; the flush loop keeps retransmission and window probes.
         let current = kcp.current_ms() as u32;
         kcp.flush_if_pending(current);
+        // acknodelay off leaves ACKs in `acklist` until the flush loop's next
+        // maintenance pass, which is at least 10ms away (`interval` clamped to
+        // `ACTIVE_UPDATE_MAX_MS`). A burst that filled a datagram was already
+        // emitted by `flush_if_pending`; this sends the remainder, so a short
+        // burst is not held for the timer. ACK-only: it does not rescan the
+        // send buffer the way `flush_with_current` does.
+        if !shared.acknodelay.load(Ordering::Acquire) && kcp.acklist_len() > 0 {
+            kcp.flush_acks_only();
+        }
 
         // Prefetch directly into the read buffer while KCP is held: holding
         // the read-buf lock across the loop preserves FIFO against direct KCP
@@ -1067,6 +1141,25 @@ pub(crate) fn process_inbound_batch(shared: &SharedIoState, datagrams: &[Vec<u8>
 
     // Publish the post-flush send window: the deferred flush is what removes
     // ACKed segments from `snd_buf`, so `wait_send` is only accurate here.
+    // A burst counts as a previous generation only when every datagram in it
+    // mismatched or restarted. A single stale retransmission mixed into fresh
+    // data does not.
+    let burst = datagrams.len() as u64;
+    if burst > 0
+        && (shared
+            .conv_mismatch
+            .load(Ordering::Relaxed)
+            .saturating_sub(mismatch_before)
+            >= burst
+            || shared
+                .peer_restart
+                .load(Ordering::Relaxed)
+                .saturating_sub(restart_before)
+                >= burst)
+    {
+        shared.stale_bursts.fetch_add(1, Ordering::Relaxed);
+    }
+
     shared.wait_send.store(ws, Ordering::Relaxed);
     if ws < shared.snd_wnd.load(Ordering::Relaxed) {
         // Directly wake any blocked writer — eliminates the need for a
@@ -1225,20 +1318,17 @@ pub(crate) fn spawn_flush_loop(shared: Arc<SharedIoState>) -> knet::JoinHandle<(
             // maintenance and may emit delayed ACKs (ack-no-delay=false).
             let ws = {
                 let now = Instant::now();
-                match next_deadline {
-                    Some(deadline) if now < deadline => continue,
-                    None => {
-                        // The write/input path already emitted any immediate
-                        // data or ACK batch before notifying us. Arm the first
-                        // maintenance deadline using the configured protocol
-                        // interval; probes and delayed ACKs are serviced then.
-                        let delay_ms = shared.kcp.lock().interval() as u64;
-                        next_deadline = Some(
-                            now + Duration::from_millis(delay_ms.clamp(1, MAX_IDLE_UPDATE_MS)),
-                        );
-                        continue;
+                // A notify wake means there is work now — never sit out a
+                // remaining deadline. A timer wake that lands early is the
+                // only case allowed to skip. (`None` also flushes: arming an
+                // interval and returning held every ACK for a full tick and
+                // pinned fast-mode latency at ~9ms.)
+                if !was_notified {
+                    if let Some(deadline) = next_deadline {
+                        if now < deadline {
+                            continue;
+                        }
                     }
-                    Some(_) => {}
                 }
                 let mut kcp = shared.kcp.lock();
                 let current = kcp.current_ms() as u32;
@@ -1275,9 +1365,16 @@ pub(crate) fn spawn_flush_loop(shared: Arc<SharedIoState>) -> knet::JoinHandle<(
                 }
                 shared.send_drained_batch(packets).await;
             } else {
-                // Writer is sending — ensure we wake to retry sending these
-                // packets on the next iteration.
-                shared.flush_notify.notify_one();
+                // The writer/input path holds the single-sender token. Do NOT
+                // self-notify here: knet::Notify coalesces notify_one into a
+                // stored permit, and this loop's very next wait would consume
+                // it instantly — a zero-interval hot loop whenever the token
+                // is contended (32 sessions sharing one socket), which pegged
+                // every core and stalled whole sessions. The token holder
+                // drains `raw_packets` wholesale before releasing, so these
+                // packets go out with its batch; anything it raced re-fires
+                // via the short deadline armed below (bounded 1ms backoff).
+                next_deadline = Some(Instant::now() + Duration::from_millis(1));
             }
         }
     })

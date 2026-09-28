@@ -59,12 +59,6 @@ const FEC_HDR: usize = FEC_HEADER_SIZE_PLUS_2;
 /// still bounding any lost-wake recovery latency.
 const WAIT_FALLBACK_MS: u64 = 10;
 
-/// Idle cap on the flush-loop sleep when the link is completely idle
-/// (`wait_send == 0`, no buffered data). `kcp.flush()` already returns the
-/// KCP interval (10–40ms) when idle; clamping to 100ms instead of the old 2ms
-/// cuts per-idle-connection timer-wheel churn ~50x, matching legacy server
-/// `MAX_IDLE_UPDATE_MS`. Busy links stay at 1ms (see flush loop).
-const MAX_IDLE_UPDATE_MS: u64 = 100;
 /// Active connections with unacknowledged data keep a fine-grained driver
 /// deadline. This is scheduling precision only; KCP's protocol interval/RTO
 /// fields remain unchanged. Idle connections still park without a timer.
@@ -111,8 +105,7 @@ mod endpoint;
 mod halves;
 mod raw_queue;
 
-pub(crate) use endpoint::process_inbound_batch;
-	pub(crate) use endpoint::SharedIoState;
+pub(crate) use endpoint::SharedIoState;
 use endpoint::{spawn_flush_loop, spawn_input_loop};
 pub use halves::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, WriteHalf};
 #[cfg(test)]
@@ -620,15 +613,6 @@ impl KcpStream {
         self.shared.is_closed()
     }
 
-    /// Mark this `KcpStream` as a non-owner: its `Drop` will NOT close the
-    /// connection. Used by `ShardedKcpListener` where the build task creates
-    /// the `KcpStream` (owner), inserts clones into the session map + accept
-    /// backlog, feeds the first batch, and then would drop the original —
-    /// closing the connection prematurely.
-    pub(crate) fn detach_owner(&mut self) {
-        self.owns_connection = false;
-    }
-
     /// Mark this `KcpStream` as the connection owner: its `Drop` will call
     /// `close()` when it is dropped. Used by `ShardedKcpListener::accept` to
     /// ensure the caller-owned stream tears down the session on drop, rather
@@ -687,6 +671,13 @@ impl KcpStream {
         self.shared.peer_restart.load(Ordering::Relaxed)
     }
 
+    /// Bursts in which every datagram belonged to a previous generation of the
+    /// peer. The listener evicts a session on this, not on a single stale
+    /// datagram inside an otherwise fresh burst.
+    pub(crate) fn stale_burst_count(&self) -> u64 {
+        self.shared.stale_bursts.load(Ordering::Relaxed)
+    }
+
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.shared.transport.local_addr()
     }
@@ -733,122 +724,13 @@ impl KcpStream {
         self.shared.kcp.lock().is_dead()
     }
 
-    /// Feed a batch of **decrypted** KCP datagrams and emit ACKs via the
-    /// deferred batch flush.
-    ///
-    /// When `background_input(false)`, the caller is an external worker on its
-    /// own runtime. Produced wire packets (ACKs / data / probes) are flushed
-    /// **inline** via [`SharedIoState::drain_and_flush_tx`], bypassing the
-    /// flush loop's notify→wake→drain→send scheduling hop. This matches the
-    /// low-latency Mode B (§10.2): decrypt + KCP input + encrypt all run on
-    /// the same worker, so the send path also stays on-thread.
-    ///
-    /// Falls back to `flush_notify` when the send token is held by another
-    /// sender (flush loop or inline writer), preserving single-owner wire
-    /// order.
-    /// Feed a batch of **raw (still-encrypted)** datagrams received by the
-    /// listener's reader thread. Each datagram is decrypted in place via
-    /// `transport.decrypt_packet_in_place`, then fed to KCP. The KCP flush
-    /// and wire send are done synchronously via `drain_and_flush_tx`.
-    ///
-    /// This is the server-side entry point for the sharded worker's **serial
-    /// pipeline**: recv → decrypt → KCP input → KCP flush → encrypt → send,
-    /// all on the worker's thread with zero async scheduling overhead.
+    /// Feed one peer's still-encrypted burst into KCP and send the ACKs it
+    /// produces before returning. Used by the listener's receive task so an
+    /// established session is not woken through its queue; the burst shares
+    /// one KCP lock, one flush and one send, and is the stale-session guard's
+    /// unit (eviction requires every datagram of the burst to mismatch).
     pub(crate) fn feed_raw_batch(&self, datagrams: Vec<Vec<u8>>) -> io::Result<()> {
-        if self.shared.is_closed() {
-            return Ok(());
-        }
-        // Decrypt each datagram in place — reuse the Vec's own buffer, no
-        // copy or allocation. `decrypt_packet_in_place` returns the
-        // plaintext length; truncate the Vec to that length.
-        // Invalid packets (pn == 0) are removed in-place via swap_remove
-        // to avoid allocating a second `Vec<Vec<u8>>`.
-        let mut datagrams = datagrams;
-        let mut write = 0usize;
-        for read in 0..datagrams.len() {
-            let n = datagrams[read].len();
-            let pn = self
-                .shared
-                .transport
-                .decrypt_packet_in_place(&mut datagrams[read], n);
-            if pn > 0 {
-                datagrams[read].truncate(pn);
-                if write != read {
-                    datagrams.swap(write, read);
-                }
-                write += 1;
-            }
-        }
-        datagrams.truncate(write);
-        self.feed_batch(datagrams)
-    }
-
-    /// Feed a single **raw (still-encrypted)** datagram — single-packet fast
-    /// path that avoids allocating a `Vec<Vec<u8>>` wrapper. Used by the
-    /// sharded worker's single-peer fast path.
-    pub(crate) fn feed_raw_single(&self, mut datagram: Vec<u8>) -> io::Result<()> {
-        if self.shared.is_closed() {
-            return Ok(());
-        }
-        let n = datagram.len();
-        let pn = self
-            .shared
-            .transport
-            .decrypt_packet_in_place(&mut datagram, n);
-        if pn == 0 {
-            return Ok(());
-        }
-        datagram.truncate(pn);
-        self.feed_single(datagram)
-    }
-
-    /// Feed a single decrypted datagram — avoids `Vec<Vec<u8>>` allocation
-    /// for the single-packet fast path.
-    pub(crate) fn feed_single(&self, datagram: Vec<u8>) -> io::Result<()> {
-        if self.shared.is_closed() {
-            crate::sharded::recycle_buf(datagram);
-            return Ok(());
-        }
-        self.shared.mark_activity();
-        let (data_ready, protocol_pending) =
-            process_inbound_batch(&self.shared, std::slice::from_ref(&datagram));
-        if data_ready {
-            self.shared.wake_reader();
-        }
-        let sent_inline = self.shared.drain_and_flush_tx();
-        if !sent_inline || protocol_pending {
-            self.shared.flush_notify.notify_one();
-        }
-        crate::sharded::recycle_buf(datagram);
-        Ok(())
-    }
-
-    pub(crate) fn feed_batch(&self, datagrams: Vec<Vec<u8>>) -> io::Result<()> {
-        if self.shared.is_closed() {
-            for d in datagrams {
-                crate::sharded::recycle_buf(d);
-            }
-            return Ok(());
-        }
-        if !datagrams.is_empty() {
-            self.shared.mark_inbound();
-        }
-        let (data_ready, protocol_pending) = process_inbound_batch(&self.shared, &datagrams);
-        if data_ready {
-            self.shared.wake_reader();
-        }
-        // Inline send: drain + send produced packets directly from the
-        // worker's thread, bypassing the flush loop. The `is_sending` CAS
-        // ensures single-owner wire order (matching the input loop's path).
-        let sent_inline = self.shared.drain_and_flush_tx();
-        // Recycle the datagram buffers back to the RX pool.
-        for d in datagrams {
-            crate::sharded::recycle_buf(d);
-        }
-        if !sent_inline || protocol_pending {
-            self.shared.flush_notify.notify_one();
-        }
-        Ok(())
+        self.shared.feed_raw_batch(datagrams)
     }
 
     /// Async read borrowing `&self` — safe for **concurrent** read/write tasks
@@ -1335,6 +1217,7 @@ impl KcpStreamBuilder {
             adopt_conv: AtomicBool::new(self.adopt_conv),
             conv_mismatch: AtomicU64::new(0),
             peer_restart: AtomicU64::new(0),
+            stale_bursts: AtomicU64::new(0),
             background_input: self.background_input,
             last_activity_ms: AtomicU64::new(knet::mono_ms()),
             last_rx_ms: AtomicU64::new(knet::mono_ms()),
@@ -1981,6 +1864,62 @@ mod integ {
         roundtrip(&mut conn_b, &mut conn_a, b"reverse-2-1").await;
         conn_a.close();
         conn_b.close();
+    }
+
+    /// The stale-session eviction guard counts WHOLE bursts: one foreign-conv
+    /// datagram inside a burst of fresh traffic must not mark the burst stale.
+    /// A live session whose ACKs are being lost retransmits segment 0 with
+    /// `una == 0`, which is indistinguishable from a re-dial unless the burst
+    /// context is honored. Regression for the session-task listener, where
+    /// per-datagram feeding made every datagram a one-packet burst and evicted
+    /// live sessions under load (32-connection request timeouts).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_guard_counts_whole_burst_not_single_datagrams() {
+        use crate::segment::Command;
+
+        let (mut conn_a, mut conn_b) = pair_conns(None).await;
+        // Establish traffic so conn_b has moved past the first segments.
+        roundtrip(&mut conn_a, &mut conn_b, b"establish").await;
+
+        // KCP header: conv(4) cmd(1) frg(1) wnd(2) ts(4) sn(4) una(4) len(4).
+        let header = |conv: u32, cmd: u8, sn: u32| {
+            let mut d = vec![0u8; 24];
+            d[0..4].copy_from_slice(&conv.to_le_bytes());
+            d[4] = cmd;
+            d[6..8].copy_from_slice(&32u16.to_le_bytes()); // advertised window
+            d[12..16].copy_from_slice(&sn.to_le_bytes());
+            d
+        };
+        let conv = 0xC0FFEE;
+        let foreign = header(0xDEAD_BEEF, Command::Push as u8, 0);
+        // An ACK for sn 0 with the correct conv: stale traffic (already acked
+        // or a duplicate), so only the foreign datagram counts as stale.
+        let stale_ack = header(conv, Command::Ack as u8, 0);
+
+        let before = conn_b.stale_burst_count();
+        conn_b
+            .feed_raw_batch(vec![foreign, stale_ack.clone(), stale_ack])
+            .unwrap();
+        assert_eq!(
+            conn_b.stale_burst_count(),
+            before,
+            "one stale datagram in a burst of fresh traffic must not count the burst stale"
+        );
+
+        // A wholly-stale burst still counts — that is the genuine re-dial
+        // signal the eviction path exists for.
+        let before = conn_b.stale_burst_count();
+        conn_b
+            .feed_raw_batch(vec![
+                header(0xDEAD_BEEF, Command::Push as u8, 0),
+                header(0xDEAD_BEEF, Command::Push as u8, 0),
+            ])
+            .unwrap();
+        assert_eq!(
+            conn_b.stale_burst_count(),
+            before + 1,
+            "a burst whose every datagram mismatches must count as stale"
+        );
     }
 
     async fn pair_conns(fec: Option<(u32, u32)>) -> (KcpStream, KcpStream) {
