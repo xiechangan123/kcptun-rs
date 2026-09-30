@@ -68,11 +68,27 @@ fn tp(x: u32) -> u32 {
     lp(tau(x))
 }
 
-#[derive(Debug)]
 pub struct Sm4Crypt {
     rk: [u32; 32],
     /// Cached `E(GO_CFB_IV)` (first CFB-128 keystream block, per-key constant).
     first_keystream: [u8; 16],
+}
+
+impl std::fmt::Debug for Sm4Crypt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sm4Crypt")
+            .field("rk", &"[REDACTED]")
+            .field("first_keystream", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for Sm4Crypt {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.rk.zeroize();
+        self.first_keystream.zeroize();
+    }
 }
 
 impl Sm4Crypt {

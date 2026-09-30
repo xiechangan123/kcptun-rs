@@ -272,7 +272,7 @@ mod tests {
             // Library client path: kcp_config_from → KcpConfig.apply.
             let mut lib = kcp_rs::KCP::new(1, 0, |_| {});
             let cfg = kcp_config_from_cli(name, 1350, 128, 512, 0, 50, 0, 0, false, 0, 0);
-            lib.apply(&cfg);
+            lib.apply(&cfg).expect("kcp config");
 
             assert_eq!(legacy.interval(), lib.interval(), "interval {name}");
             assert_eq!(legacy.snd_wnd(), lib.snd_wnd(), "snd_wnd {name}");
@@ -309,7 +309,8 @@ mod tests {
                 0,
                 DEFAULT_CONV,
                 0,
-            ));
+            ))
+            .expect("kcp config");
 
             assert_eq!(
                 lib.interval(),
@@ -347,7 +348,7 @@ mod tests {
         assert_eq!(cfg.parityshard, 3);
 
         let mut kcp = kcp_rs::KCP::new(1, 0, |_| {});
-        kcp.apply(&cfg);
+        kcp.apply(&cfg).expect("kcp config");
         // Explicit interval 25 (≥10) is used verbatim — not a mode curve.
         assert_eq!(kcp.interval(), 25);
     }

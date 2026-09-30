@@ -51,7 +51,10 @@ pub mod wire;
 // Keep the deprecated compatibility functions reachable for downstream users;
 // new code should call `CryptEngine::select`.
 #[allow(deprecated)]
-pub use crypt::{select_aead_crypt, select_block_crypt, AeadCrypt, BlockCrypt, CryptEngine};
+pub use crypt::{
+    select_aead_crypt, select_block_crypt, validate_crypt_method, AeadCrypt, BlockCrypt,
+    CryptEngine,
+};
 pub use wire::{
     decrypt_cfb_in_place, encrypt_batch, encrypt_batch_into, encrypt_batch_ref_into, inbound_null,
     should_cpu_block_compress, should_cpu_block_decrypt, should_cpu_block_encrypt,

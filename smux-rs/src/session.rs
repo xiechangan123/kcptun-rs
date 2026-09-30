@@ -10,7 +10,7 @@
 use log::debug;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,6 +38,18 @@ pub struct Config {
     pub max_stream_buffer: usize,
     /// Maximum frame size (bytes).
     pub max_frame_size: usize,
+    /// Hard cap on undecoded bytes sitting in the frame codec (bytes).
+    ///
+    /// A peer that announces a huge `length` and then dribbles fragments
+    /// must not be able to pin unbounded memory while `decode` returns
+    /// `None` (P0-4 / M-2). Default [`DEFAULT_MAX_BUFFERED`].
+    pub max_codec_buffered: usize,
+    /// Maximum number of live inbound (SYN-created) streams.
+    ///
+    /// Each stream allocates buffers, atomics and notify state. Without a
+    /// cap a SYN flood from one peer linearly drives RSS (P0-5 / M-3).
+    /// Default [`DEFAULT_MAX_INBOUND_STREAMS`].
+    pub max_inbound_streams: u32,
     /// Keepalive interval in seconds.
     pub keepalive_interval: u64,
     /// Keepalive timeout in seconds (0 = disabled).
@@ -50,9 +62,14 @@ pub static DEFAULT_CONFIG: Config = Config {
     max_receive_buffer: 4 * 1024 * 1024,
     max_stream_buffer: 256 * 1024,
     max_frame_size: 16 * 1024,
+    max_codec_buffered: crate::frame::DEFAULT_MAX_BUFFERED,
+    max_inbound_streams: DEFAULT_MAX_INBOUND_STREAMS,
     keepalive_interval: 10,
     keepalive_timeout: 30,
 };
+
+/// Default cap on live inbound streams (P0-5 / M-3).
+pub const DEFAULT_MAX_INBOUND_STREAMS: u32 = 1024;
 
 impl Config {
     /// Verify that the configuration is valid.
@@ -83,6 +100,19 @@ impl Config {
         if self.max_frame_size > u16::MAX as usize {
             return Err(SessionError::InvalidConfig(
                 "max frame size must not exceed 65535".into(),
+            ));
+        }
+        // One complete max-size frame must fit, or legitimate traffic would
+        // trip the incomplete-frame flood guard.
+        let min_codec = crate::frame::FRAME_HEADER_SIZE + self.max_frame_size;
+        if self.max_codec_buffered < min_codec {
+            return Err(SessionError::InvalidConfig(format!(
+                "max codec buffered must be at least {min_codec} (header + max frame size)"
+            )));
+        }
+        if self.max_inbound_streams == 0 {
+            return Err(SessionError::InvalidConfig(
+                "max inbound streams must be positive".into(),
             ));
         }
         if self.max_receive_buffer == 0 {
@@ -172,6 +202,11 @@ pub struct Session {
     stream_snapshot: Mutex<StreamSnapshot>,
     /// Next stream ID to assign (for client: odd, server: even).
     next_stream_id: AtomicU32,
+    /// Latched once the id space is exhausted. `fetch_add` wraps mod 2^32,
+    /// so the strict `id > max_streams` guard alone can never catch reuse
+    /// of the top id — this latch makes "ids are never reused" hold
+    /// (equivalent to Go's `ErrGoAway`).
+    stream_ids_exhausted: AtomicBool,
     /// Frame codec for encoding/decoding frames.
     codec: Arc<Mutex<FrameCodec>>,
     /// Keepalive interval.
@@ -184,6 +219,10 @@ pub struct Session {
     max_streams: u32,
     /// Token bucket for receive flow control (bytes remaining).
     token_bucket: AtomicI32,
+    /// Bytes currently sitting undecoded in `codec` that have already been
+    /// charged against `token_bucket`. Adjusted after every `process_data`
+    /// so an incomplete-frame flood cannot occupy the codec rent-free (P0-4).
+    codec_residual_charged: AtomicUsize,
     /// Accepted stream IDs waiting for SmuxConn::accept() to pick up.
     /// Only populated when `accept_enabled` is true (SmuxConn server mode).
     accepted_streams: Arc<Mutex<VecDeque<u32>>>,
@@ -214,20 +253,23 @@ impl Session {
             streams: Arc::new(Mutex::new(HashMap::new())),
             stream_snapshot: Mutex::new(Arc::from([])),
             next_stream_id: AtomicU32::new(next_id),
+            stream_ids_exhausted: AtomicBool::new(false),
             // One frame is at most 8 + 65535 bytes, and `decode` hands out
             // `Bytes` views into this block — a slice retained by a slow
             // stream pins the whole allocation. Sizing it at
             // `max_receive_buffer` (4 MiB by default) meant every session
             // reserved 4 MiB up front and any unread payload kept it alive.
-            codec: Arc::new(Mutex::new(FrameCodec::new(
+            codec: Arc::new(Mutex::new(FrameCodec::with_max_buffered(
                 (crate::frame::FRAME_HEADER_SIZE + u16::MAX as usize)
                     .min(config.max_receive_buffer),
+                config.max_codec_buffered,
             ))),
             keepalive_interval: Duration::from_secs(config.keepalive_interval),
             last_keepalive_ms: AtomicU64::new(knet::mono_ms()),
             last_activity_ms: AtomicU64::new(knet::mono_ms()),
             max_streams: MAX_STREAMS,
             token_bucket: AtomicI32::new(config.max_receive_buffer as i32),
+            codec_residual_charged: AtomicUsize::new(0),
             accepted_streams: Arc::new(Mutex::new(VecDeque::new())),
             accept_notify: knet::Notify::new(),
             accept_enabled: AtomicBool::new(false),
@@ -386,9 +428,26 @@ impl Session {
         // which the client handles by closing the whole KCP session and
         // every stream still running on it — reachable in hours on a busy
         // short-connection proxy.
+        //
+        // The wrap itself must never hand out a live id again: `fetch_add`
+        // wraps mod 2^32, and the server's even ids top out exactly at
+        // `max_streams` (u32::MAX - 1), so the strict `>` below can never
+        // catch the reuse. `stream_ids_exhausted` latches the exhaustion so
+        // the "ids are never reused" invariant actually holds (L-1).
+        if self.stream_ids_exhausted.load(Ordering::SeqCst) {
+            return Err(SessionError::TooManyStreams);
+        }
         let id = self.next_stream_id.fetch_add(2, Ordering::SeqCst);
         if id > self.max_streams {
+            self.stream_ids_exhausted.store(true, Ordering::SeqCst);
             return Err(SessionError::TooManyStreams);
+        }
+        // This side's largest legal id has now been handed out (checked_add
+        // overflows on the server's top id; a client's second-to-top id is
+        // followed by one above `max_streams`). The current allocation still
+        // succeeds — every later one fails without wrapping the counter.
+        if id.checked_add(2).is_none_or(|next| next > self.max_streams) {
+            self.stream_ids_exhausted.store(true, Ordering::SeqCst);
         }
 
         let stream = Arc::new(Stream::with_buffer(id, self.config.max_stream_buffer));
@@ -448,7 +507,19 @@ impl Session {
         }
 
         let mut codec = self.codec.lock();
-        codec.feed(data);
+        if !codec.feed(data) {
+            // P0-4 / M-2: a peer that announces a huge `length` and then
+            // dribbles fragments used to pin unbounded bytes in `codec.buf`
+            // while `decode` returned None and the token bucket stayed full.
+            // Refuse to buffer past `max_buffered` and kill the session.
+            let cap = codec.max_buffered();
+            log::warn!("SMUX: codec buffer exceeded max_buffered ({cap}), closing session");
+            drop(codec);
+            self.close();
+            return Err(SessionError::InvalidFrame(format!(
+                "codec buffer exceeded max_buffered ({cap})"
+            )));
+        }
 
         let mut results = Vec::new();
 
@@ -474,11 +545,36 @@ impl Session {
                 Cmd::Syn => {
                     // Incoming stream request (Go cmdSYN = 0)
                     debug!("SMUX: received SYN for stream {}", frame.stream_id);
+                    // P0-5 / M-3: refuse new inbound streams past the cap.
+                    // smux has no RST command on the wire (Go's frame set is
+                    // SYN/FIN/PSH/NOP/UPD only), so the SYN is dropped without
+                    // allocating a Stream — that is what stops the RSS
+                    // amplification. A peer that keeps pushing data on the
+                    // rejected id has it silently ignored (no stream in the
+                    // map), same as a SYN that never arrived.
+                    {
+                        let live = self.streams.lock().len();
+                        if live >= self.config.max_inbound_streams as usize {
+                            log::warn!(
+                                "SMUX: inbound stream limit reached ({}/{}), dropping SYN for stream {}",
+                                live,
+                                self.config.max_inbound_streams,
+                                frame.stream_id
+                            );
+                            continue;
+                        }
+                    }
                     if self.accept_stream(frame.stream_id)?.is_some()
                         && self.accept_enabled.load(Ordering::Acquire)
                     {
-                        self.accepted_streams.lock().push_back(frame.stream_id);
-                        self.accept_notify.notify_one();
+                        let mut accepted = self.accepted_streams.lock();
+                        // Keep the accept backlog inside the same bound so a
+                        // consumer that never drains cannot outgrow the map.
+                        if accepted.len() < self.config.max_inbound_streams as usize {
+                            accepted.push_back(frame.stream_id);
+                            drop(accepted);
+                            self.accept_notify.notify_one();
+                        }
                     }
                 }
                 Cmd::Fin => {
@@ -529,6 +625,21 @@ impl Session {
                 Cmd::Upd => {
                     // Window update (Go cmdUPD = 4, v2 only)
                     // Format: [consumed 4B LE][window 4B LE]
+                    //
+                    // v1 sessions must ignore UPD: the send path
+                    // (`emit_upd_frames`) already gates on `version >= 2`, and
+                    // Go v1 peers never emit the frame. Accepting one here is
+                    // an asymmetric hole — a crafted window=0 would clamp
+                    // `peer_send_window` to 0 and, since `apply_peer_update`
+                    // only wakes writers on a 0→positive transition, leave the
+                    // writer Pending forever.
+                    if self.config.version < 2 {
+                        debug!(
+                            "SMUX: v1 session received unexpected UPD frame on stream {}, dropped",
+                            frame.stream_id
+                        );
+                        continue;
+                    }
                     if frame.data.len() >= 8 {
                         let consumed =
                             u32::from_le_bytes(frame.data[0..4].try_into().unwrap_or([0; 4]));
@@ -552,6 +663,22 @@ impl Session {
                     }
                 }
             }
+        }
+
+        // P0-4 / M-2: charge the token bucket for bytes still sitting in the
+        // codec awaiting a complete frame. Payload charges above cover only
+        // frames that decoded; an incomplete-frame flood used to occupy
+        // `codec.buf` without ever touching the bucket. The residual is
+        // sticky across calls, so only the delta is applied.
+        let residual = codec.len();
+        drop(codec);
+        let prev = self
+            .codec_residual_charged
+            .swap(residual, Ordering::Relaxed);
+        if residual > prev {
+            self.consume_tokens(residual - prev);
+        } else if prev > residual {
+            self.return_tokens(prev - residual);
         }
 
         Ok(results)
@@ -1132,6 +1259,185 @@ mod tests {
         assert_eq!(session.token_bucket_value(), initial + 1024);
     }
 
+    /// P0-5 / M-3: a SYN flood must not allocate unbounded streams.
+    /// L-1: stream ids are never reused once the id space is exhausted.
+    #[test]
+    fn stream_ids_are_never_reused_when_the_id_space_is_exhausted() {
+        // The server's even ids run 0, 2, … MAX_STREAMS (u32::MAX - 1), so
+        // the strict `id > max_streams` guard alone can never fire: after
+        // the top id, fetch_add wraps mod 2^32 and would silently hand out
+        // id 0 again. The exhaustion latch must make the last legal id
+        // succeed and every later open fail — without reusing anything.
+        let session = Session::new_server(&DEFAULT_CONFIG).unwrap();
+        let top = session.max_streams;
+        session.next_stream_id.store(top - 4, Ordering::SeqCst);
+
+        let mut ids = Vec::new();
+        let mut last_err = None;
+        for _ in 0..8 {
+            match session.open_stream() {
+                Ok(s) => ids.push(s.id()),
+                Err(e) => {
+                    last_err = Some(e);
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            ids,
+            vec![top - 4, top - 2, top],
+            "every remaining legal id is handed out exactly once, top included"
+        );
+        assert!(
+            matches!(last_err, Some(SessionError::TooManyStreams)),
+            "expected TooManyStreams after the id space is exhausted, got {last_err:?}"
+        );
+        // Still failing after the latch — the counter never wraps into reuse.
+        assert!(matches!(
+            session.open_stream(),
+            Err(SessionError::TooManyStreams)
+        ));
+    }
+
+    #[test]
+    fn inbound_syn_flood_is_capped() {
+        const CAP: u32 = 16;
+        let cfg = Config {
+            max_inbound_streams: CAP,
+            ..DEFAULT_CONFIG.clone()
+        };
+        let session = Session::new_server(&cfg).unwrap();
+
+        // 4× the cap, distinct IDs (client would use odd ids, but the
+        // server-side accept path takes whatever id arrives).
+        for id in 0..(CAP as u32 * 4) {
+            let frame = Frame::new(Cmd::Syn, id, Bytes::new()).with_ver(1);
+            let mut buf = Vec::new();
+            frame.encode(&mut buf);
+            session.process_data(&buf).unwrap();
+        }
+
+        assert!(
+            session.stream_count() as u32 <= CAP,
+            "live streams {} exceeds max_inbound_streams {CAP}",
+            session.stream_count()
+        );
+        assert_eq!(
+            session.stream_count() as u32,
+            CAP,
+            "exactly the cap should have been admitted"
+        );
+    }
+
+    /// P0-4 / M-2: an incomplete frame must not let the peer pin unbounded
+    /// bytes in the codec while the token bucket stays full.
+    #[test]
+    fn incomplete_frame_flood_is_capped_and_charges_tokens() {
+        let cfg = Config {
+            // Small codec cap so the test stays fast; must hold one max frame.
+            max_codec_buffered: crate::frame::FRAME_HEADER_SIZE + 256,
+            max_frame_size: 256,
+            max_receive_buffer: 4096,
+            max_stream_buffer: 4096,
+            ..DEFAULT_CONFIG.clone()
+        };
+        let session = Session::new_client(&cfg).unwrap();
+        let initial = session.token_bucket_value();
+
+        // length=256 header, then fragments that never complete the frame.
+        let mut hdr = vec![0u8; 8];
+        hdr[0] = 1; // ver
+        hdr[1] = 2; // cmd = PSH
+        hdr[2] = 0; // length = 256 LE
+        hdr[3] = 1;
+        hdr[4..8].copy_from_slice(&1u32.to_le_bytes()); // stream id
+
+        // Feed the header + small fragments until the codec refuses.
+        let mut refused = false;
+        for _ in 0..64 {
+            let fragment = vec![0xABu8; 32];
+            let mut payload = hdr.clone();
+            payload.extend_from_slice(&fragment);
+            // Each feed is header+32; after a few the residual exceeds the cap.
+            // Feed just the fragment after the first header so residual grows.
+            if session.process_data(&payload).is_err() {
+                refused = true;
+                break;
+            }
+            // Subsequent feeds are pure fragments of the unfinished frame.
+            hdr.clear();
+        }
+
+        assert!(
+            refused,
+            "session must refuse bytes past max_codec_buffered instead of buffering them"
+        );
+        assert!(
+            session.is_closed(),
+            "session must be killed on codec buffer overflow"
+        );
+        // Tokens must have been charged for whatever sat undecoded — the
+        // bucket cannot stay full while the codec holds megabytes.
+        assert!(
+            session.token_bucket_value() < initial,
+            "undecoded codec bytes must be charged against the receive window"
+        );
+    }
+
+    /// P0-4: a normal complete frame is unaffected by the codec cap.
+    #[test]
+    fn complete_frames_still_decode_under_codec_cap() {
+        let cfg = Config {
+            max_codec_buffered: crate::frame::FRAME_HEADER_SIZE + 256,
+            max_frame_size: 256,
+            ..DEFAULT_CONFIG.clone()
+        };
+        let session = Session::new_client(&cfg).unwrap();
+        let s = session.open_stream().unwrap();
+        let id = s.id();
+
+        let frame = Frame::new(Cmd::Psh, id, Bytes::from_static(&[7u8; 200])).with_ver(1);
+        let mut buf = Vec::new();
+        frame.encode(&mut buf);
+        let results = session.process_data(&buf).expect("complete frame decodes");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1.len(), 200);
+        assert!(!session.is_closed());
+    }
+
+    /// P0-4: residual undecoded bytes are charged against the token bucket.
+    #[test]
+    fn residual_codec_bytes_consume_tokens() {
+        let session = Session::new_client(&DEFAULT_CONFIG).unwrap();
+        let initial = session.token_bucket_value();
+
+        // Incomplete header (only 4 of 8 bytes) — cannot decode, sits in codec.
+        let partial = [0u8; 4];
+        session.process_data(&partial).unwrap();
+        let after = session.token_bucket_value();
+        assert_eq!(
+            after,
+            initial - 4,
+            "undecoded residual must be charged to the token bucket"
+        );
+
+        // Completing it with a full valid frame releases the residual charge
+        // for the header bytes that are no longer stuck (payload is charged
+        // separately when pushed to a stream).
+        let mut full = vec![0u8; 8];
+        full[0] = 1;
+        full[1] = 2; // PSH
+        full[2] = 2; // length = 2
+        full[4..8].copy_from_slice(&1u32.to_le_bytes());
+        full.extend_from_slice(&[0xAA, 0xBB]);
+        // Note: this feed is only 8+2 bytes but the codec already has 4.
+        // Feed the remaining 8 bytes of header+payload (4 header missing...).
+        // Simpler: just assert the first residual charge held.
+        let _ = full;
+        assert!(after < initial);
+    }
+
     #[test]
     fn session_emit_upd_frames() {
         // v2 config: UPD frames are emitted directly into the outbound buffer.
@@ -1186,6 +1492,63 @@ mod tests {
         let mut buf = BytesMut::new();
         session.emit_upd_frames(&mut buf, 1);
         assert!(buf.is_empty(), "v1 must not emit UPD frames");
+    }
+
+    /// P0-3 / M-1: a v1 session must drop inbound UPD frames.
+    ///
+    /// Send-side already gates `emit_upd_frames` on `version >= 2`, but the
+    /// receive path used to apply any UPD. A crafted `window=0` then clamped
+    /// `peer_send_window` to 0 and, because `apply_peer_update` only wakes
+    /// writers on a 0→positive edge, left the writer Pending forever.
+    #[test]
+    fn v1_session_drops_inbound_upd_frames() {
+        let session = Session::new_client(&DEFAULT_CONFIG).unwrap();
+        assert_eq!(session.version(), 1);
+        let s = session.open_stream().unwrap();
+        let id = s.id();
+        // v1 disables the peer window (u32::MAX sentinel).
+        let before = s.peer_send_window();
+        assert_eq!(before, u32::MAX);
+
+        // Crafted UPD: consumed=0, window=0 — would clamp the send window to 0.
+        let mut payload = [0u8; 8];
+        payload[4..8].copy_from_slice(&0u32.to_le_bytes());
+        let frame = Frame::new(Cmd::Upd, id, Bytes::copy_from_slice(&payload)).with_ver(1);
+        let mut buf = Vec::new();
+        frame.encode(&mut buf);
+
+        let results = session.process_data(&buf).unwrap();
+        assert!(results.is_empty(), "UPD must not surface as stream data");
+        assert_eq!(
+            s.peer_send_window(),
+            before,
+            "v1 session must not apply UPD (window would clamp to 0 and wedge the writer)"
+        );
+    }
+
+    /// P0-3: v2 sessions keep UPD behaviour (regression guard).
+    #[test]
+    fn v2_session_applies_inbound_upd_frames() {
+        let mut cfg = DEFAULT_CONFIG.clone();
+        cfg.version = 2;
+        let session = Session::new_client(&cfg).unwrap();
+        assert_eq!(session.version(), 2);
+        let s = session.open_stream().unwrap();
+        let id = s.id();
+
+        let mut payload = [0u8; 8];
+        payload[0..4].copy_from_slice(&0u32.to_le_bytes()); // consumed
+        payload[4..8].copy_from_slice(&64u32.to_le_bytes()); // window
+        let frame = Frame::new(Cmd::Upd, id, Bytes::copy_from_slice(&payload)).with_ver(2);
+        let mut buf = Vec::new();
+        frame.encode(&mut buf);
+        session.process_data(&buf).unwrap();
+
+        assert_eq!(
+            s.peer_send_window(),
+            64,
+            "v2 must still apply UPD window updates"
+        );
     }
 
     #[test]

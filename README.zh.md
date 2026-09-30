@@ -84,6 +84,20 @@ kcptun-rs 在**几乎所有加密算法和压缩组合下都超越 Go kcptun**�
 
 ---
 
+## 🔐 加密认证说明
+
+只有 `aes-128-gcm` 对密文做了认证（AEAD）。其余后端都是 CFB（或流式 XOR）
+加 CRC32 校验，**没有 MAC**——网络攻击者可以伪造或篡改数据包。这是 Go
+kcptun 线缆格式的固有设计，改了就破坏互操作。
+
+| 加密算法 | 有认证 | 说明 |
+|----------|--------|------|
+| `aes-128-gcm` | ✅ **有** | AEAD；**生产环境推荐** |
+| `aes` / `aes-128` / `aes-192` 等 CFB 系 | ❌ 无 | 仅 CRC32 |
+| `xor` / `none` / `null` | ❌ 无 | **仅供调试，禁止生产** |
+
+生产环境请优先使用 `--crypt aes-128-gcm`。
+
 ## 🚀 快速开始
 
 ```bash
@@ -126,6 +140,16 @@ kcptun-client -c config.json
 ```
 
 > ⚠️ **`--key`、`--crypt`、`--mode` 和 `--nocomp` 必须客户端与服务端一致。** 压缩默认开启。
+
+**新增服务端参数：** `--peripsessionrate`（每 IP 新建会话速率，默认 20/s）、`--maxsessionsperip`（每 IP 并发会话上限，默认 0=不限）、`--pprofaddr`（pprof 监听地址，默认 `127.0.0.1:6060`）。
+
+**L-4 决策记录：** RTT 仅在 `snd_buf` 命中时采样**有意不做**——Go kcp-go 对每个带合法时间戳的 ACK 都更新 RTT（在 `parse_ack` 之前），改动会偏离 RTO 行为并破坏互操作。详见 `AGENTS.md`。
+
+**JSON 配置规则（审计加固）：**
+- JSON 中的值优先于命令行参数。
+- **未知字段直接报错**（`deny_unknown_fields`）——把 `"shards"` 写成 `"shard"` 会在启动时失败，而不是被静默忽略。
+- 服务端专属字段 `"shards"` 已支持（语义同 `--shards`）。
+- 非法值启动即失败：`--crypt` 必须是已知算法，`--mtu` ≥ 50，`--dscp` 0–63，`--conn` ≤ 256，`--shards` ≤ 64。
 
 ---
 
@@ -497,6 +521,7 @@ net.inet.udp.recvspace=4194304
 每个 shard 是独立的 SO_REUSEPORT socket、由独立线程处理，不存在共享 fd 的发送争用。
 
 - 默认（`--shards 0`）：**Linux** 上每个逻辑 CPU 一个 shard；其他平台单 shard（macOS 的 SO_REUSEPORT 不分发 UDP 流）。
+- **硬上限 64**：每个 shard 是一个 OS 线程 + 一个绑定的 UDP socket；更大的值会在启动时报错退出（以前会 `expect` panic/abort）。
 - 经验法则：**shards ≈ vCPU 数**。1–2 vCPU 的机器保持 1 个 shard —— 多余的 worker 在同一个核上只增加跨核唤醒（N=2 reuseport 路径功能验证正确，但在单 vCPU 上严格更慢）。
 
 ### 3. 内核 CFS wakeup granularity —— Linux 上对 P99 影响最大的单项参数

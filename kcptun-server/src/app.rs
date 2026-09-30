@@ -12,6 +12,22 @@ use crate::cli::{Cli, Config};
 use crate::server;
 use crate::socket;
 
+/// Hard cap on `--shards`. Each shard is one OS thread + one bound UDP socket;
+/// past this the process dies in `thread::Builder::spawn` (and `panic=abort`
+/// turns that into a full abort). 64 is well past any realistic core count.
+pub(crate) const MAX_SHARDS: u32 = 64;
+
+/// Validate an explicit `--shards` value (0 = platform default).
+pub(crate) fn validate_shards(shards: u32) -> Result<()> {
+    if shards > MAX_SHARDS {
+        anyhow::bail!(
+            "--shards {} exceeds the maximum of {MAX_SHARDS} (each shard is one OS thread + one bound UDP socket)",
+            shards
+        );
+    }
+    Ok(())
+}
+
 pub(crate) async fn async_main(cli: Cli) -> Result<()> {
     // Ignore SIGPIPE to prevent crashes when writing to closed sockets.
     knet::ignore_sigpipe();
@@ -59,6 +75,10 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
 
     let key_str = cli.key.as_deref().unwrap_or("it's a secrect");
     let crypt_method = cli.crypt.as_deref().unwrap_or("aes");
+    // P2 / L-9: unknown --crypt used to silently fall back to aes.
+    if let Err(e) = kcrypt_rs::validate_crypt_method(crypt_method) {
+        anyhow::bail!("{e}");
+    }
     let mode = cli.mode.as_deref().unwrap_or("fast");
     let mtu = cli.mtu.unwrap_or(1350);
     let sndwnd = cli.sndwnd.unwrap_or(1024);
@@ -66,6 +86,12 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
     let datashard = cli.datashard;
     let parityshard = cli.parityshard;
     let dscp_val = cli.dscp.unwrap_or(0);
+    // P2 / L-11: DSCP is a 6-bit field (0–63). Higher values silently
+    // overflow the TOS byte.
+    anyhow::ensure!(
+        dscp_val <= 63,
+        "dscp {dscp_val} out of range (must be 0–63)"
+    );
     let sockbuf = cli.sockbuf.unwrap_or(4 * 1024 * 1024);
     let nocomp = cli.nocomp;
     let acknodelay = cli.acknodelay;
@@ -114,8 +140,9 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
     // Derive encryption key
     let key = kcptun_common::derive_key(key_str);
     info!(
-        "key derived: crypt={}, key={:02x}..{:02x}",
-        crypt_method, key[0], key[31]
+        "key derived: crypt={}, key=[REDACTED len={}]",
+        crypt_method,
+        key.len()
     );
     info!(
         "session watchdog: ack-stall window={}s ({}), fast path needs peer-restart evidence",
@@ -174,6 +201,7 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
         keepalive_interval: keepalive.max(0) as u64,
         // Go's BuildSmuxConfig changes only the interval; timeout remains 30s.
         keepalive_timeout: keepalivetimeout,
+        ..smux_rs::DEFAULT_CONFIG.clone()
     };
     let session_config = kcptun_common::KcptunConfig {
         kcp: kcp_config,
@@ -211,21 +239,35 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
                 let session_config = session_config.clone();
                 let target_loop = target.to_string();
                 let qpp_key_loop = key.to_vec();
+                let stop_tcp = stop_flag.clone();
                 knet::spawn_task(async move {
                     loop {
-                        let (conn, peer) = match listener.accept().await {
-                            Ok(c) => c,
-                            Err(e)
+                        if stop_tcp.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        // The parked accept cannot observe stop_flag, so
+                        // bound the wait — this lets SIGTERM/Ctrl-C end the
+                        // tcpraw loop (and, via listener drop, its accept
+                        // threads) within ~500ms instead of hanging forever.
+                        let (conn, peer) = match knet::timeout(
+                            Duration::from_millis(500),
+                            listener.accept(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(c)) => c,
+                            Ok(Err(e))
                                 if e.kind() == std::io::ErrorKind::WouldBlock
                                     || e.kind() == std::io::ErrorKind::Interrupted =>
                             {
                                 knet::sleep_ms(10).await;
                                 continue;
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 error!("TCP accept error on {}: {}", addr, e);
                                 break;
                             }
+                            Err(_) => continue, // timeout → re-check stop_flag
                         };
                         info!("TCP raw session from {}", peer);
                         let socket = Arc::new(knet::DatagramSocket::TcpRaw(conn));
@@ -271,12 +313,19 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
     // parallel workers, no shared-fd send contention); non-Linux (Darwin does
     // not SO_REUSEPORT-distribute) defaults to a single socket. Explicit
     // `--shards N` overrides either default.
+    //
+    // P0-7 / M-5: reject absurd values outright. Clamping silently would
+    // hide the operator's mistake; an unbounded N used to reserve a giant
+    // Vec, bind N sockets and spawn N OS threads, then abort on the first
+    // spawn failure (`expect` + `panic=abort`).
+    validate_shards(cli.shards)?;
     let shards = if cli.shards == 0 {
         #[cfg(target_os = "linux")]
         {
             std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1)
+                .min(MAX_SHARDS as usize)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -339,12 +388,16 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
     // Start pprof if configured (requires --features pprof)
     #[cfg(feature = "pprof")]
     if cli.pprof {
-        info!("starting pprof HTTP server on :6060");
+        let pprof_addr = cli.pprofaddr.clone();
+        info!("starting pprof HTTP server on {pprof_addr}");
         #[cfg(feature = "pprof-deadlock")]
         kpprof::start_deadlock_detector();
         let pprof_stop = stop_flag.clone();
         knet::spawn_task(async move {
-            if let Err(e) = kpprof::run_pprof("0.0.0.0:6060", pprof_stop).await {
+            // P1-7 / M-14: bind loopback by default — the profile endpoint
+            // exposes process internals and must not face the network.
+            // `--pprofaddr` can override (e.g. 0.0.0.0:6060 for Go parity).
+            if let Err(e) = kpprof::run_pprof(&pprof_addr, pprof_stop).await {
                 error!("pprof server error: {}", e);
             }
         });
@@ -364,6 +417,15 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
     }
 
     info!("using shared kcptun server session stack");
+
+    // Every KcpListener created for a UDP shard. Closed explicitly at
+    // shutdown so the receive task and per-peer queues release immediately
+    // (M-7 rework: the comment claiming "accept loops have already seen
+    // stop" was wrong for the KCP path — listeners were never closed).
+    let kcp_listeners: Arc<std::sync::Mutex<Vec<Arc<kcp_rs::KcpListener>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let per_ip_rate = cli.peripsessionrate;
+    let max_per_ip = cli.maxsessionsperip;
 
     for udp in udp_sockets {
         // Encrypt each accepted peer's transport via kcp-rs' listener wrapper
@@ -385,6 +447,11 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
             let listener = Arc::new(
                 kcp_rs::KcpListener::from_socket(udp)
                     .config(shard_config.kcp.clone())
+                    .limits(kcp_rs::WorkerPoolLimits {
+                        per_ip_session_rate: per_ip_rate,
+                        max_sessions_per_ip: max_per_ip,
+                        ..Default::default()
+                    })
                     .transport_wrapper(move |transport: Arc<dyn PacketTransport>, _peer| {
                         let mut ct = kcptun_common::CryptoTransport::with_transport(
                             transport,
@@ -398,6 +465,7 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
                     .build()
                     .await?,
             );
+            kcp_listeners.lock().unwrap().push(listener.clone());
             knet::spawn_task(serve_udp_shard(
                 listener,
                 target,
@@ -412,11 +480,12 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
             continue;
         }
 
+        let kcp_listeners_shard = kcp_listeners.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
         // Each shard runs on a dedicated OS thread + current-thread runtime:
         // this shard's fd is only touched by one worker → no shared-socket
         // send contention (Linux SO_REUSEPORT hashes peers across shards).
-        std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name("kcptun-shard".into())
             .spawn(move || {
                 knet::block_on_local(async move {
@@ -430,6 +499,11 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
                     };
                     let listener = match kcp_rs::KcpListener::from_socket(udp)
                         .config(shard_config.kcp.clone())
+                        .limits(kcp_rs::WorkerPoolLimits {
+                            per_ip_session_rate: per_ip_rate,
+                            max_sessions_per_ip: max_per_ip,
+                            ..Default::default()
+                        })
                         .transport_wrapper(move |transport: Arc<dyn PacketTransport>, _peer| {
                             let mut ct = kcptun_common::CryptoTransport::with_transport(
                                 transport,
@@ -449,6 +523,7 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
                             return;
                         }
                     };
+                    kcp_listeners_shard.lock().unwrap().push(listener.clone());
                     let _ = ready_tx.send(Ok(()));
                     serve_udp_shard(
                         listener,
@@ -463,8 +538,17 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
                     )
                     .await;
                 })
-            })
-            .expect("spawn shard worker");
+            }) {
+            Ok(_handle) => {}
+            Err(error) => {
+                // P0-7 / M-5: a spawn failure used to `expect` and abort the
+                // whole process (release profile has `panic=abort`). Report
+                // and unwind cleanly so the operator gets a real exit code.
+                error!("failed to spawn shard worker: {error}");
+                stop_flag.store(true, Ordering::Relaxed);
+                return Err(error).context("spawn shard worker");
+            }
+        }
         ready_rx
             .recv()
             .context("UDP shard startup channel closed")??;
@@ -479,9 +563,29 @@ pub(crate) async fn async_main(cli: Cli) -> Result<()> {
         }
     }
 
-    // Graceful shutdown
+    // Graceful shutdown (M-7 rework):
+    // 1. Close every KcpListener so their receive tasks stop and pending
+    //    accepts drain — previously they were left running and only the
+    //    process teardown killed them.
+    // 2. Then give in-flight stream handlers a grace period to flush and
+    //    close cleanly (P1-2) instead of tearing them mid-pipe.
     info!("shutting down...");
-    knet::sleep(Duration::from_secs(1)).await;
+    {
+        let listeners: Vec<_> = kcp_listeners.lock().unwrap().drain(..).collect();
+        for l in &listeners {
+            l.close();
+        }
+        if !listeners.is_empty() {
+            info!("closed {} KCP listener(s)", listeners.len());
+        }
+    }
+    let drained = knet::inflight::wait_drain(Duration::from_secs(5)).await;
+    if !drained {
+        warn!(
+            "graceful shutdown timed out with {} stream(s) still in flight",
+            knet::inflight::active()
+        );
+    }
     info!("bye");
 
     Ok(())
@@ -537,5 +641,24 @@ async fn serve_udp_shard(
             close_wait,
             Some(listener.clone()),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P0-7 / M-5: `--shards` above the cap must fail fast, not abort later
+    /// in `thread::Builder::spawn`.
+    #[test]
+    fn shards_above_cap_is_rejected() {
+        assert!(validate_shards(0).is_ok(), "0 = platform default");
+        assert!(validate_shards(1).is_ok());
+        assert!(validate_shards(4).is_ok());
+        assert!(validate_shards(MAX_SHARDS).is_ok());
+        let err = validate_shards(MAX_SHARDS + 1).unwrap_err().to_string();
+        assert!(err.contains("exceeds the maximum"), "got: {err}");
+        let err = validate_shards(100_000).unwrap_err().to_string();
+        assert!(err.contains("exceeds the maximum"), "got: {err}");
     }
 }

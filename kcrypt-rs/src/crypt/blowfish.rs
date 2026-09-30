@@ -18,10 +18,17 @@ pub struct BlowfishCrypt {
 }
 
 impl BlowfishCrypt {
-    pub fn new(key: &[u8]) -> Self {
-        BlowfishCrypt {
-            cipher: <Blowfish as KeyInit>::new_from_slice(key).expect("invalid blowfish key"),
+    /// Create a Blowfish engine. Fail-fast on invalid key length (P2 / L-6):
+    /// 57–72 byte keys used to `panic!`. The `blowfish` crate accepts 4–56;
+    /// Go's accepts up to 72 — anything outside the crate's range is rejected
+    /// cleanly rather than aborting the process.
+    pub fn new(key: &[u8]) -> Result<Self, &'static str> {
+        if !(4..=56).contains(&key.len()) {
+            return Err("blowfish: key must be 4–56 bytes");
         }
+        let cipher =
+            <Blowfish as KeyInit>::new_from_slice(key).map_err(|_| "blowfish: invalid key")?;
+        Ok(BlowfishCrypt { cipher })
     }
 
     /// Encrypt one 8-byte block in place (CFB register / ciphertext feedback).
@@ -70,7 +77,7 @@ mod tests {
     #[test]
     fn bfish() {
         rt(
-            &BlowfishCrypt::new(b"test-key"),
+            &BlowfishCrypt::new(b"test-key").unwrap(),
             &mut b"hello kcp bf!".to_vec(),
         );
     }

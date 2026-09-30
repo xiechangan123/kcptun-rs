@@ -140,14 +140,15 @@ fn encrypted_listener_accept_echo() {
         let addr = listener.local_addr().unwrap();
 
         let sock = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        let mut client = KcpStream::with_transport(wrap(Arc::new(knet::DatagramSocket::Udp(sock))), addr)
-            .connected(false)
-            .conv(CONV)
-            .mode(KcpMode::Fast3)
-            .connect_timeout(Duration::from_secs(3))
-            .build()
-            .await
-            .expect("encrypted connect_timeout: handshake datagram was dropped");
+        let mut client =
+            KcpStream::with_transport(wrap(Arc::new(knet::DatagramSocket::Udp(sock))), addr)
+                .connected(false)
+                .conv(CONV)
+                .mode(KcpMode::Fast3)
+                .connect_timeout(Duration::from_secs(3))
+                .build()
+                .await
+                .expect("encrypted connect_timeout: handshake datagram was dropped");
 
         let (mut server, _peer) = knet::timeout(Duration::from_secs(3), listener.accept())
             .await
@@ -213,23 +214,25 @@ fn encrypted_listener_multiple_peers() {
         let addr = listener.local_addr().unwrap();
 
         let sock_a = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        let client_a = KcpStream::with_transport(wrap(Arc::new(knet::DatagramSocket::Udp(sock_a))), addr)
-            .connected(false)
-            .conv(CONV)
-            .mode(KcpMode::Fast3)
-            .connect_timeout(Duration::from_secs(3))
-            .build()
-            .await
-            .unwrap();
+        let client_a =
+            KcpStream::with_transport(wrap(Arc::new(knet::DatagramSocket::Udp(sock_a))), addr)
+                .connected(false)
+                .conv(CONV)
+                .mode(KcpMode::Fast3)
+                .connect_timeout(Duration::from_secs(3))
+                .build()
+                .await
+                .unwrap();
         let sock_b = knet::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        let client_b = KcpStream::with_transport(wrap(Arc::new(knet::DatagramSocket::Udp(sock_b))), addr)
-            .connected(false)
-            .conv(CONV)
-            .mode(KcpMode::Fast3)
-            .connect_timeout(Duration::from_secs(3))
-            .build()
-            .await
-            .unwrap();
+        let client_b =
+            KcpStream::with_transport(wrap(Arc::new(knet::DatagramSocket::Udp(sock_b))), addr)
+                .connected(false)
+                .conv(CONV)
+                .mode(KcpMode::Fast3)
+                .connect_timeout(Duration::from_secs(3))
+                .build()
+                .await
+                .unwrap();
 
         let (mut server_a, _) = knet::timeout(Duration::from_secs(3), listener.accept())
             .await

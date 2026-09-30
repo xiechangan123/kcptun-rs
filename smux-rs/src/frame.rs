@@ -16,6 +16,12 @@ pub const FRAME_HEADER_SIZE: usize = 8;
 /// Maximum frame payload size.
 pub const MAX_FRAME_SIZE: usize = 60000;
 
+/// Default hard cap on undecoded codec bytes. An incomplete frame with a
+/// large `length` field would otherwise pin every subsequent byte in
+/// `FrameCodec::buf` until the first frame completes, bypassing receive
+/// flow control entirely (P0-4 / M-2).
+pub const DEFAULT_MAX_BUFFERED: usize = 4 * 1024 * 1024;
+
 /// SMUX command codes matching Go xtaci/smux.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,21 +176,43 @@ impl Frame {
 /// A codec for reading/writing SMUX frames from a byte stream.
 pub struct FrameCodec {
     buf: BytesMut,
+    max_buffered: usize,
 }
 
 impl FrameCodec {
-    /// Create a new FrameCodec.
+    /// Create a new FrameCodec with [`DEFAULT_MAX_BUFFERED`] as the cap.
     #[inline]
     pub fn new(capacity: usize) -> Self {
+        Self::with_max_buffered(capacity, DEFAULT_MAX_BUFFERED)
+    }
+
+    /// Create a new FrameCodec with an explicit undecoded-bytes cap.
+    #[inline]
+    pub fn with_max_buffered(capacity: usize, max_buffered: usize) -> Self {
         FrameCodec {
             buf: BytesMut::with_capacity(capacity),
+            max_buffered: max_buffered.max(1),
         }
     }
 
-    /// Feed incoming bytes into the codec.
+    /// Hard cap on undecoded buffered bytes.
     #[inline]
-    pub fn feed(&mut self, data: &[u8]) {
+    pub fn max_buffered(&self) -> usize {
+        self.max_buffered
+    }
+
+    /// Feed incoming bytes into the codec.
+    ///
+    /// Returns `false` (and does not buffer) when the new data would push the
+    /// undecoded buffer past [`max_buffered`](Self::max_buffered). The caller
+    /// must treat that as a protocol violation and kill the session.
+    #[inline]
+    pub fn feed(&mut self, data: &[u8]) -> bool {
+        if self.buf.len().saturating_add(data.len()) > self.max_buffered {
+            return false;
+        }
         self.buf.extend_from_slice(data);
+        true
     }
 
     /// Try to decode a frame from the buffered data.

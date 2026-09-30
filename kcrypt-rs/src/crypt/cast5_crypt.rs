@@ -6,16 +6,25 @@
 
 use super::{cfb8_decrypt, cfb8_encrypt, BlockCipher8, BlockCrypt};
 
-#[derive(Debug)]
 pub struct Cast5Crypt {
     cipher: crate::cast5::Cast5Cipher,
 }
 
+impl std::fmt::Debug for Cast5Crypt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cast5Crypt")
+            .field("cipher", &"[REDACTED]")
+            .finish()
+    }
+}
+
 impl Cast5Crypt {
-    pub fn new(key: &[u8]) -> Self {
-        let cipher = crate::cast5::Cast5Cipher::new(key)
-            .unwrap_or_else(|_| crate::cast5::Cast5Cipher::new(&[0u8; 16]).unwrap());
-        Cast5Crypt { cipher }
+    /// Create a CAST5 engine. Fail-fast on a bad key length (P1-5 / M-10):
+    /// the old `unwrap_or_else` silently encrypted with an all-zero key.
+    /// Go's `cast5.NewCipher` is fail-fast too.
+    pub fn new(key: &[u8]) -> Result<Self, &'static str> {
+        let cipher = crate::cast5::Cast5Cipher::new(key)?;
+        Ok(Cast5Crypt { cipher })
     }
 }
 
@@ -50,8 +59,21 @@ mod tests {
     #[test]
     fn c5() {
         rt(
-            &Cast5Crypt::new(b"test-key-12345"),
+            &Cast5Crypt::new(b"test-key-1234567").unwrap(),
             &mut b"hello cast5".to_vec(),
         );
+    }
+
+    /// P1-5 / M-10: a wrong-length key must be a hard error, not a silent
+    /// all-zero-key fallback.
+    #[test]
+    fn cast5_rejects_invalid_key_length() {
+        assert!(Cast5Crypt::new(b"short").is_err());
+        // The old test key was 14 bytes and used to hit the zero-key fallback!
+        assert!(Cast5Crypt::new(b"test-key-12345").is_err());
+        assert!(Cast5Crypt::new(b"test-key-1234567").is_ok());
+        assert!(Cast5Crypt::new(&[0u8; 15]).is_err());
+        assert!(Cast5Crypt::new(&[0u8; 16]).is_ok());
+        assert!(Cast5Crypt::new(&[0u8; 17]).is_err());
     }
 }

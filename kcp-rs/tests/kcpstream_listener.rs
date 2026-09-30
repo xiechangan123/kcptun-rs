@@ -494,7 +494,6 @@ fn listener_take_error_initial_none() {
     });
 }
 
-
 /// A build that *finishes after* `close()` must not be published: the accept
 /// queue refuses it and the session does not linger in the map.
 /// `testing_build_delay` holds the finished build so `close()` lands in that
@@ -663,6 +662,68 @@ fn sweep_reaps_closed_sessions_without_remove_peer() {
             }
             knet::sleep_ms(50).await;
         }
+        listener.close();
+    });
+}
+
+/// Item 9 rework: a single source IP must not be able to pin the whole
+/// session budget by varying source ports. The per-IP concurrent cap
+/// counts published + building entries for that address.
+#[test]
+fn per_ip_session_limit_bounds_admission_from_one_address() {
+    knet::block_on(async {
+        let listener = KcpListener::bind("127.0.0.1:0")
+            .conv(CONV)
+            .mode(KcpMode::Fast3)
+            .limits(WorkerPoolLimits {
+                // Global budget off on purpose: only the per-IP cap may act.
+                max_sessions_per_worker: 0,
+                max_sessions_per_ip: 2,
+                // Rate limit off so it cannot mask the concurrent cap.
+                per_ip_session_rate: 0,
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Every peer shares 127.0.0.1 and differs only in source port — the
+        // exact shape of a single host trying to pin the whole global budget.
+        let mut datagram = vec![0u8; 24];
+        datagram[0..4].copy_from_slice(&CONV.to_le_bytes());
+        datagram[4] = 81;
+        datagram[6..8].copy_from_slice(&32u16.to_le_bytes());
+
+        for _ in 0..6 {
+            let sock =
+                knet::UdpSocket::connect(SocketAddr::from(([127, 0, 0, 1], 0)), addr).unwrap();
+            sock.send(&datagram).await.unwrap();
+            knet::sleep_ms(5).await;
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while listener.stats().session_drops < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "peers past the per-IP cap were not refused (drops={})",
+                listener.stats().session_drops
+            );
+            knet::sleep_ms(20).await;
+        }
+        assert!(
+            listener.session_count() <= 2,
+            "published sessions from one IP must never exceed the per-IP cap (sessions={})",
+            listener.session_count()
+        );
+        // Building entries are counted too — the sum must also respect the cap.
+        assert!(
+            listener.session_count() + listener.building_count() <= 2,
+            "sessions+building from one IP must respect the per-IP cap ({}+{})",
+            listener.session_count(),
+            listener.building_count()
+        );
+
         listener.close();
     });
 }

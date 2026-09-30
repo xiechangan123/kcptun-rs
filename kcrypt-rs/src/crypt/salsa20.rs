@@ -14,9 +14,23 @@
 
 use super::BlockCrypt;
 
-#[derive(Debug)]
 pub struct Salsa20Crypt {
     key: [u8; 32],
+}
+
+impl std::fmt::Debug for Salsa20Crypt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Salsa20Crypt")
+            .field("key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for Salsa20Crypt {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.key.zeroize();
+    }
 }
 
 impl Salsa20Crypt {

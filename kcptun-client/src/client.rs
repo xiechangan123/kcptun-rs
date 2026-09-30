@@ -70,6 +70,7 @@ pub(crate) async fn build_session(
         // transient dropout into a session teardown that kills every stream on
         // it (measured: 20MB downloads cut to 0-3MB, one session death each).
         keepalive_timeout: cfg.keepalivetimeout,
+        ..smux_rs::DEFAULT_CONFIG.clone()
     };
     let config = kcptun_common::KcptunConfig {
         kcp: params.to_kcp_config(),

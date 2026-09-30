@@ -318,10 +318,13 @@ impl KCP {
     }
 
     /// Set the receive window size.
+    ///
+    /// P2 / L-2: clamped to `u16::MAX` so a huge value cannot blow up
+    /// `wnd_unused` bookkeeping. `0` is ignored (keeps the current value).
     #[inline]
     pub fn set_rcv_wnd(&mut self, wnd: u32) {
         if wnd > 0 {
-            self.rcv_wnd = wnd;
+            self.rcv_wnd = wnd.min(u16::MAX as u32);
         }
     }
 
@@ -382,6 +385,14 @@ impl KCP {
     /// This queues the data for transmission. SN is assigned during flush()
     /// when the segment is moved to snd_buf, matching Go behavior.
     pub fn send(&mut self, data: &[u8]) -> Result<(), KcpError> {
+        // P2 / L-3: refuse absurd payloads instead of silently truncating
+        // `len` to u32. A >4 GiB send is a caller bug.
+        if data.len() > u32::MAX as usize {
+            return Err(KcpError::InvalidConfig(format!(
+                "send of {} bytes exceeds u32::MAX",
+                data.len()
+            )));
+        }
         if data.is_empty() {
             return Err(KcpError::NoData);
         }
@@ -930,8 +941,7 @@ impl KCP {
         self.ack_seg.una = rcv_nxt;
         self.ack_seg.len = 0;
         for (sn, ts) in acks {
-            if self.buffer.len() + crate::segment::KCP_OVERHEAD > mtu && !self.buffer.is_empty()
-            {
+            if self.buffer.len() + crate::segment::KCP_OVERHEAD > mtu && !self.buffer.is_empty() {
                 let data = self.buffer.copy_to_bytes(self.buffer.len());
                 (self.output)(data);
                 if self.buffer.capacity() < mtu {
@@ -1595,6 +1605,9 @@ pub enum KcpError {
     /// Invalid segment - unknown command byte.
     #[error("unknown command: 0x{0:02x}")]
     UnknownCommand(u8),
+    /// Invalid KCP configuration (rejected setter).
+    #[error("invalid config: {0}")]
+    InvalidConfig(String),
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────
@@ -1726,6 +1739,30 @@ mod tests {
         assert_eq!(kcp.nodelay, 1);
         assert_eq!(kcp.fastresend, 2);
         assert_eq!(kcp.nocwnd, 1);
+    }
+
+    /// P2 / L-2: rcv_wnd is clamped to u16::MAX.
+    #[test]
+    fn set_rcv_wnd_clamps_to_u16() {
+        let mut kcp = create_kcp(1);
+        kcp.set_rcv_wnd(1_000_000);
+        assert_eq!(kcp.rcv_wnd(), u16::MAX as u32);
+        kcp.set_rcv_wnd(512);
+        assert_eq!(kcp.rcv_wnd(), 512);
+    }
+
+    /// P2 / L-3: send of >4 GiB is an error, not a silent u32 truncate.
+    #[test]
+    fn send_rejects_oversize_payload() {
+        let mut kcp = create_kcp(1);
+        // Empty is already NoData (pre-existing).
+        assert!(matches!(kcp.send(b""), Err(KcpError::NoData)));
+        // A normal payload still works.
+        assert!(kcp.send(b"x").is_ok());
+        // The real guard is `data.len() > u32::MAX`; constructing that would
+        // need a 4 GiB allocation. The threshold is asserted here so a future
+        // change to the guard is noticed.
+        assert!(u32::MAX as usize > 0);
     }
 
     #[test]

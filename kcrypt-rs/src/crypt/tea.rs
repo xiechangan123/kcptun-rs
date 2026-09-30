@@ -9,9 +9,23 @@
 
 use super::{cfb8_decrypt, cfb8_encrypt, BlockCipher8, BlockCrypt};
 
-#[derive(Debug)]
 pub struct TeaCrypt {
     key: [u8; 16],
+}
+
+impl std::fmt::Debug for TeaCrypt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TeaCrypt")
+            .field("key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for TeaCrypt {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.key.zeroize();
+    }
 }
 
 impl TeaCrypt {

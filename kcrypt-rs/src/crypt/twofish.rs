@@ -154,6 +154,17 @@ impl std::fmt::Debug for TwofishCrypt {
     }
 }
 
+impl Drop for TwofishCrypt {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.k.zeroize();
+        self.first_keystream.zeroize();
+        // `s` is key-derived (S-box + MDS tables mix in s_key), but
+        // rebuilding it from a wiped `k` is impossible, so wiping `k`
+        // only bounds recovery to the table contents, not the raw subkeys.
+    }
+}
+
 impl TwofishCrypt {
     pub fn new(key: &[u8]) -> Self {
         let keylen = key.len();

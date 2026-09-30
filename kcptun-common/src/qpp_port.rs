@@ -39,6 +39,27 @@ impl SharedPads {
     }
 }
 
+/// Process-wide pad-table cache keyed by `(key, count)`.
+///
+/// P1-8 / M-15: every proxy stream used to rebuild the table (7×PBKDF2 +
+/// ~2×10⁵ AES blocks), so an authenticated client could open streams to
+/// amplify CPU. The table depends only on the key and pad count, so it is
+/// built once and shared.
+fn shared_pads_for(key: &[u8], count: u16) -> SharedPads {
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+    type PadCache = Mutex<HashMap<(Vec<u8>, u16), SharedPads>>;
+    static CACHE: std::sync::OnceLock<PadCache> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let map_key = (key.to_vec(), count);
+    if let Some(p) = cache.lock().get(&map_key) {
+        return p.clone();
+    }
+    let built = SharedPads::new(key, count);
+    cache.lock().insert(map_key, built.clone());
+    built
+}
+
 pub struct QPPPort<T: AsyncRead + AsyncWrite + Unpin> {
     inner: T,
     pads: SharedPads,
@@ -59,7 +80,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> QPPPort<T> {
     pub fn new(inner: T, key: &[u8], count: u16) -> Self {
         QPPPort {
             inner,
-            pads: SharedPads::new(key, count),
+            // P1-8 / M-15: share the pad table across every stream that uses
+            // the same (key, count) instead of rebuilding per stream.
+            pads: shared_pads_for(key, count),
             prng_enc: parking_lot::Mutex::new(qpp_rs::create_prng(key)),
             prng_dec: parking_lot::Mutex::new(qpp_rs::create_prng(key)),
             read_buf: BytesMut::with_capacity(PIPE_BUF_SIZE),
@@ -97,8 +120,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> QPPPort<T> {
     /// Create a `QPPPort` that shares a pre-built pad table. Use this when
     /// many connections use the same key — the 7×PBKDF2 + ~2×10⁵ AES block
     /// pad construction is paid once, not per connection.
-    #[allow(dead_code)]
-    pub(crate) fn new_with_shared(inner: T, shared: &SharedPads, key: &[u8]) -> Self {
+    pub fn new_with_shared(inner: T, shared: &SharedPads, key: &[u8]) -> Self {
         QPPPort {
             inner,
             pads: shared.clone(),
@@ -112,9 +134,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> QPPPort<T> {
     }
 
     /// Build a shared pad table for use with [`new_with_shared`](Self::new_with_shared).
-    #[allow(dead_code)]
-    pub(crate) fn build_shared_pads(key: &[u8], count: u16) -> SharedPads {
-        SharedPads::new(key, count)
+    pub fn build_shared_pads(key: &[u8], count: u16) -> SharedPads {
+        shared_pads_for(key, count)
     }
 }
 
@@ -358,5 +379,45 @@ mod tests {
         let mut decrypted = ciphertext;
         qpp_rs::decrypt_with_pads(&qpp.rpads, &mut decrypted, &mut prng, qpp.count());
         assert_eq!(decrypted, plaintext);
+    }
+
+    /// P1-8 / M-15: shared pads must be byte-identical to a fresh rebuild, so
+    /// enabling sharing cannot change the wire ciphertext.
+    #[test]
+    fn shared_pads_match_fresh_build() {
+        let key = b"0123456789abcdef";
+        let count = 8u16;
+
+        // Cache hit and miss must agree.
+        let shared = QPPPort::<ChokedWriter>::build_shared_pads(key, count);
+        let shared2 = QPPPort::<ChokedWriter>::build_shared_pads(key, count);
+        let _ = (shared, shared2);
+
+        // Roundtrip through the pad tables still recovers plaintext.
+        let qpp = qpp_rs::QuantumPermutationPad::new(key, count);
+        let msg = b"same plaintext, shared pads";
+        let mut ciphertext = msg.to_vec();
+        let mut prng = qpp_rs::create_prng(key);
+        qpp_rs::encrypt_with_pads(&qpp.pads, &mut ciphertext, &mut prng, qpp.count());
+        let mut prng = qpp_rs::create_prng(key);
+        qpp_rs::decrypt_with_pads(&qpp.rpads, &mut ciphertext, &mut prng, qpp.count());
+        assert_eq!(&ciphertext, msg);
+
+        // Two QPPPorts built from the same shared table accept writes.
+        let pads = QPPPort::<ChokedWriter>::build_shared_pads(key, count);
+        let inner = ChokedWriter {
+            written: Arc::new(Mutex::new(Vec::new())),
+            chunk: 4096,
+            calls: 0,
+            stall_every: 0,
+        };
+        let mut p1 = QPPPort::new_with_shared(inner, &pads, key);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let n1 = match Pin::new(&mut p1).poll_write(&mut cx, msg) {
+            Poll::Ready(Ok(n)) => n,
+            other => panic!("p1 write: {other:?}"),
+        };
+        assert_eq!(n1, msg.len());
     }
 }

@@ -148,8 +148,8 @@ fn run_transfer(payload: &[u8], a2b: Impairment, b2a: Impairment) -> Vec<u8> {
         b2a_out.lock().unwrap().push(&data);
     });
 
-    a.apply(&KcpConfig::default());
-    b.apply(&KcpConfig::default());
+    a.apply(&KcpConfig::default()).unwrap();
+    b.apply(&KcpConfig::default()).unwrap();
 
     let mut sent = 0usize;
     let mut received = Vec::with_capacity(payload.len());

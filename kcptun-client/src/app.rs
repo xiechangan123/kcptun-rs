@@ -5,11 +5,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 
 use crate::cli::{Cli, Config};
 use crate::client::{self, ClientDialOptions};
 use crate::socket;
+
+/// Hard cap on `--conn` (P1-3 / M-8). Each conn is a session + task + socket.
+pub(crate) const MAX_CONNS: u32 = 256;
+
+/// Validate the `--conn` pool size.
+pub(crate) fn validate_conn_count(conn: u32) -> Result<()> {
+    anyhow::ensure!(conn > 0, "conn must be greater than 0 (got {conn})");
+    anyhow::ensure!(
+        conn <= MAX_CONNS,
+        "conn {conn} exceeds the maximum of {MAX_CONNS} (each conn is a session + task + socket)"
+    );
+    Ok(())
+}
 
 enum LocalListener {
     Tcp(knet::TcpListener),
@@ -115,9 +128,15 @@ pub(crate) async fn async_main() -> Result<()> {
 
     let key_str = cli.key.as_deref().unwrap_or("it's a secrect");
     let crypt = cli.crypt.as_deref().unwrap_or("aes");
+    // P2 / L-9: unknown --crypt used to silently fall back to aes.
+    if let Err(e) = kcrypt_rs::validate_crypt_method(crypt) {
+        anyhow::bail!("{e}");
+    }
     let mode = cli.mode.as_deref().unwrap_or("fast");
     let conn_count = cli.conn.unwrap_or(1);
-    anyhow::ensure!(conn_count > 0, "conn must be greater than 0");
+    // P1-3 / M-8: `--conn` used to be only `> 0`, so `--conn 1000000` opened
+    // millions of tasks + fds and wedged the start-up loop.
+    validate_conn_count(conn_count)?;
     let mtu = cli.mtu.unwrap_or(1350);
     let sndwnd = cli.sndwnd.unwrap_or(128);
     let rcvwnd = cli.rcvwnd.unwrap_or(512);
@@ -146,6 +165,8 @@ pub(crate) async fn async_main() -> Result<()> {
     let closewait = cli.closewait.unwrap_or(0).max(0) as u64;
     let ratelimit = cli.ratelimit;
     let dscp = cli.dscp.unwrap_or(0);
+    // P2 / L-11: DSCP is a 6-bit field (0–63).
+    anyhow::ensure!(dscp <= 63, "dscp {dscp} out of range (must be 0–63)");
     #[cfg(feature = "qpp")]
     let qpp_enabled = cli.qpp;
     #[cfg(not(feature = "qpp"))]
@@ -198,8 +219,9 @@ pub(crate) async fn async_main() -> Result<()> {
     };
 
     info!(
-        "key derived: crypt={}, key={:02x}..{:02x}",
-        crypt, key[0], key[31]
+        "key derived: crypt={}, key=[REDACTED len={}]",
+        crypt,
+        key.len()
     );
     info!(
         "session watchdog: ack-stall window={}s ({}), fast path needs peer-restart evidence",
@@ -310,12 +332,15 @@ pub(crate) async fn async_main() -> Result<()> {
     // Start pprof if configured (requires --features pprof)
     #[cfg(feature = "pprof")]
     if cli.pprof {
-        info!("starting pprof HTTP server on :6060");
+        let pprof_addr = cli.pprofaddr.clone();
+        info!("starting pprof HTTP server on {pprof_addr}");
         #[cfg(feature = "pprof-deadlock")]
         kpprof::start_deadlock_detector();
         let pprof_stop = stop_flag.clone();
         knet::spawn_task(async move {
-            if let Err(e) = kpprof::run_pprof("0.0.0.0:6060", pprof_stop).await {
+            // P1-7 / M-14: bind loopback by default. `--pprofaddr` can
+            // override (e.g. 0.0.0.0:6060 for Go parity).
+            if let Err(e) = kpprof::run_pprof(&pprof_addr, pprof_stop).await {
                 error!("pprof server error: {}", e);
             }
         });
@@ -538,6 +563,10 @@ pub(crate) async fn async_main() -> Result<()> {
 
             let qpp_key = key.to_vec();
             knet::spawn_task(async move {
+                // P1-2 / M-7: keep the handler visible to graceful shutdown
+                // so an in-flight transfer can finish instead of being torn
+                // down mid-pipe when the runtime goes away.
+                let _inflight = knet::inflight::guard();
                 if let Err(e) = client::handle_client(
                     local,
                     smux_stream,
@@ -562,10 +591,34 @@ pub(crate) async fn async_main() -> Result<()> {
         }
     }
 
-    // Graceful shutdown
+    // Graceful shutdown: stop accepting (loop already exited), then give
+    // in-flight stream handlers a grace period to flush and close cleanly.
     info!("shutting down...");
-    knet::sleep_ms(1000).await;
+    let drained = knet::inflight::wait_drain(Duration::from_secs(5)).await;
+    if !drained {
+        warn!(
+            "graceful shutdown timed out with {} stream(s) still in flight",
+            knet::inflight::active()
+        );
+    }
     info!("bye");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P1-3 / M-8: `--conn` must reject absurd pool sizes at startup.
+    #[test]
+    fn conn_count_is_capped() {
+        assert!(validate_conn_count(1).is_ok());
+        assert!(validate_conn_count(4).is_ok());
+        assert!(validate_conn_count(MAX_CONNS).is_ok());
+        assert!(validate_conn_count(0).is_err());
+        assert!(validate_conn_count(MAX_CONNS + 1).is_err());
+        let err = validate_conn_count(100_000).unwrap_err().to_string();
+        assert!(err.contains("exceeds the maximum"), "got: {err}");
+    }
 }

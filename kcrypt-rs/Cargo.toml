@@ -1,6 +1,6 @@
 [package]
 name = "kcrypt-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Shared block/AEAD cipher library for kcptun-rs (Go kcp-go wire-compatible)"
 
@@ -18,6 +18,7 @@ aes-gcm = "0.10"
 crc32fast = "1"
 parking_lot = "0.12"
 thiserror.workspace = true
+zeroize = "1"
 
 [features]
 default = ["wire"]

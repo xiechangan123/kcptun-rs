@@ -70,6 +70,15 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 /// map is a remote memory-exhaustion primitive. Raise it through
 /// [`WorkerPoolLimits`] to serve more.
 const DEFAULT_MAX_SESSIONS: usize = 4096;
+/// Consecutive all-stale bursts required before eviction (P0-6 / M-4).
+const DEFAULT_STALE_EVICT_THRESHOLD: u32 = 3;
+/// Minimum wall-clock span of a stale streak before eviction. Together with
+/// the burst-count threshold this keeps eviction off until a peer has been
+/// *persistently* talking in a previous generation — one lost-ACK burst, or
+/// a short forged burst, must not tear a live session down.
+const EVICT_MIN_STALE_SPAN_MS: u64 = 1000;
+/// Default per-IP new-session rate (P1-10).
+const DEFAULT_PER_IP_SESSION_RATE: u32 = 20;
 
 /// Default idle-session reap threshold. A KCP session with no inbound datagram
 /// and no successful write for this long is closed and removed.
@@ -137,6 +146,18 @@ pub struct WorkerPoolLimits {
     /// without this timeout an abandoned peer is pinned until the process
     /// exits.
     pub idle_timeout: Duration,
+    /// Consecutive all-stale bursts required before a session is evicted
+    /// (P0-6 / M-4). `1` reproduces the old single-burst behaviour; the
+    /// default `3` survives an ACK-blackhole RTO of segment 0.
+    pub stale_evict_threshold: u32,
+    /// Max **new sessions per second** from one IP (P1-10). `0` disables.
+    /// Only admission is limited — established sessions keep full throughput.
+    pub per_ip_session_rate: u32,
+    /// Max concurrent sessions (published + building) admitted per source IP
+    /// (`0` = unlimited). Opt-in defence-in-depth: the rate limit above does
+    /// not bound how many sessions one host can *hold*, so a slow-and-steady
+    /// client can still pin the whole global budget by varying source ports.
+    pub max_sessions_per_ip: usize,
 }
 
 impl Default for WorkerPoolLimits {
@@ -147,6 +168,9 @@ impl Default for WorkerPoolLimits {
             max_drain_packets: 0,
             building_timeout: DEFAULT_BUILDING_TIMEOUT,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            stale_evict_threshold: DEFAULT_STALE_EVICT_THRESHOLD,
+            per_ip_session_rate: DEFAULT_PER_IP_SESSION_RATE,
+            max_sessions_per_ip: 0,
         }
     }
 }
@@ -156,6 +180,8 @@ impl Default for WorkerPoolLimits {
 pub struct WorkerPoolStats {
     /// Sessions currently in the map.
     pub sessions: usize,
+    /// Sessions currently under construction (`building` table).
+    pub building: usize,
     /// Datagrams dropped because a session's inbound queue was full.
     pub channel_drops: u64,
     /// New sessions refused because `max_sessions_per_worker` was reached.
@@ -208,6 +234,7 @@ struct Session {
 pub struct KcpListener {
     socket: Arc<knet::DatagramSocket>,
     sessions: Arc<Mutex<HashMap<SocketAddr, Session>>>,
+    building: Arc<Mutex<HashMap<SocketAddr, BuildingEntry>>>,
     pending: Arc<Mutex<VecDeque<PendingAccept>>>,
     accept_notify: Arc<Notify>,
     closed: Arc<AtomicBool>,
@@ -279,6 +306,11 @@ impl KcpListener {
     /// Current number of known peer sessions.
     pub fn session_count(&self) -> usize {
         self.sessions.lock().len()
+    }
+
+    /// Current number of peers whose session is still being built.
+    pub fn building_count(&self) -> usize {
+        self.building.lock().len()
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -405,6 +437,7 @@ impl KcpListener {
     pub fn stats(&self) -> WorkerPoolStats {
         WorkerPoolStats {
             sessions: self.sessions.lock().len(),
+            building: self.building.lock().len(),
             channel_drops: self.stats.channel_drops.load(Ordering::Relaxed),
             session_drops: self.stats.session_drops.load(Ordering::Relaxed),
             build_failures: self.stats.build_failures.load(Ordering::Relaxed),
@@ -437,7 +470,10 @@ impl KcpListenerBuilder {
     /// Wrap each accepted peer transport before constructing its `KcpStream`.
     pub fn transport_wrapper<F>(mut self, wrapper: F) -> Self
     where
-        F: Fn(Arc<dyn crate::transport::PacketTransport>, SocketAddr) -> Arc<dyn crate::transport::PacketTransport>
+        F: Fn(
+                Arc<dyn crate::transport::PacketTransport>,
+                SocketAddr,
+            ) -> Arc<dyn crate::transport::PacketTransport>
             + Send
             + Sync
             + 'static,
@@ -473,7 +509,10 @@ impl KcpListenerBuilder {
             Some(s) => s,
             None => {
                 let addr = self.addr.ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "KcpListener: bind address required")
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "KcpListener: bind address required",
+                    )
                 })?;
                 Arc::new(knet::DatagramSocket::Udp(knet::UdpSocket::bind(addr)?))
             }
@@ -505,12 +544,14 @@ impl KcpListenerBuilder {
             config: self.config,
             transport_wrapper: self.transport_wrapper,
             limits,
+            ip_limiter: Arc::new(Mutex::new(HashMap::new())),
             testing_build_delay: self.testing_build_delay,
         });
 
         Ok(KcpListener {
             socket,
             sessions,
+            building,
             pending,
             accept_notify,
             closed,
@@ -593,9 +634,41 @@ struct RxArgs {
     config: KcpConfig,
     transport_wrapper: Option<TransportWrapper>,
     limits: WorkerPoolLimits,
+    /// Per-IP new-session rate limiter (P1-10).
+    ip_limiter: Arc<Mutex<HashMap<std::net::IpAddr, (Instant, u32)>>>,
     /// Test hook: hold a finished build before publishing. See
     /// [`KcpListenerBuilder::testing_build_delay`].
     testing_build_delay: Duration,
+}
+
+/// P1-10: admit at most `rate` new sessions per second from one IP.
+/// Returns `false` when the peer is over budget. Only *new* sessions are
+/// limited — established ones keep full throughput.
+fn allow_new_session(
+    limiter: &Mutex<HashMap<std::net::IpAddr, (Instant, u32)>>,
+    ip: std::net::IpAddr,
+    rate: u32,
+) -> bool {
+    if rate == 0 {
+        return true;
+    }
+    let mut map = limiter.lock();
+    // Opportunistic sweep so a spoofed-source flood cannot grow the map
+    // without bound.
+    if map.len() > 4096 {
+        let now = Instant::now();
+        map.retain(|_, (win, _)| now.duration_since(*win) < Duration::from_secs(1));
+    }
+    let now = Instant::now();
+    let entry = map.entry(ip).or_insert((now, 0));
+    if now.duration_since(entry.0) >= Duration::from_secs(1) {
+        *entry = (now, 0);
+    }
+    if entry.1 >= rate {
+        return false;
+    }
+    entry.1 += 1;
+    true
 }
 
 fn spawn_rx(args: RxArgs) -> knet::JoinHandle<()> {
@@ -749,7 +822,14 @@ fn spawn_rx(args: RxArgs) -> knet::JoinHandle<()> {
                 }
             }
 
-            process_burst(&args, &mut burst, &mut groups, &mut group_index, inbox_cap, &mut watched);
+            process_burst(
+                &args,
+                &mut burst,
+                &mut groups,
+                &mut group_index,
+                inbox_cap,
+                &mut watched,
+            );
             // `feed_raw_batch` updated every watched session's stale counter
             // before returning, so the eviction check needs no yield.
             if !watched.is_empty() {
@@ -864,15 +944,70 @@ fn deliver_group(
         return;
     }
 
-    // Admission is decided before any state is allocated.
-    if args.limits.max_sessions_per_worker > 0
-        && args.sessions.lock().len() >= args.limits.max_sessions_per_worker
+    // Admission is decided before any state is allocated. In-flight builds
+    // count against the cap: with `--crypt none`/`null` the integrity gate
+    // below is a no-op, so a spoofed source-address flood would otherwise
+    // pile up unbounded `building` entries (each a spawn task + PeerQueue)
+    // while every published session is still under the limit.
+    //
+    // Lock order is `building` then `sessions`, matching the publish path.
     {
+        let building = args.building.lock();
+        let sessions = args.sessions.lock();
+        if args.limits.max_sessions_per_worker > 0
+            && sessions.len() + building.len() >= args.limits.max_sessions_per_worker
+        {
+            drop(sessions);
+            drop(building);
+            args.stats.session_drops.fetch_add(1, Ordering::Relaxed);
+            for buf in datagrams {
+                recycle_buf(buf);
+            }
+            return;
+        }
+    }
+
+    // P1-10: per-IP new-session rate limit (defence in depth). Without crypto
+    // a single host can burn the whole `max_sessions_per_worker` quota.
+    if !allow_new_session(&args.ip_limiter, peer.ip(), args.limits.per_ip_session_rate) {
         args.stats.session_drops.fetch_add(1, Ordering::Relaxed);
+        log::debug!("listener: per-IP session rate limit hit for {}", peer.ip());
         for buf in datagrams {
             recycle_buf(buf);
         }
         return;
+    }
+
+    // Opt-in per-IP cap on pinned session state. The rate limit above does
+    // not bound how many sessions one address can *hold*, so a slow-and-steady
+    // client can still pin the whole `max_sessions_per_worker` budget by
+    // varying source ports. Counted at admission only.
+    if args.limits.max_sessions_per_ip > 0 {
+        let building_for_ip = args
+            .building
+            .lock()
+            .iter()
+            .filter(|(k, _)| k.ip() == peer.ip())
+            .count();
+        let sessions_for_ip = args
+            .sessions
+            .lock()
+            .iter()
+            .filter(|(k, _)| k.ip() == peer.ip())
+            .count();
+        if building_for_ip + sessions_for_ip >= args.limits.max_sessions_per_ip {
+            args.stats.session_drops.fetch_add(1, Ordering::Relaxed);
+            log::debug!(
+                "listener: per-IP concurrent session cap hit for {} ({}+{})",
+                peer.ip(),
+                building_for_ip,
+                sessions_for_ip
+            );
+            for buf in datagrams {
+                recycle_buf(buf);
+            }
+            return;
+        }
     }
 
     // Integrity-gate a *copy* of the first datagram: one that fails the
@@ -907,9 +1042,25 @@ fn deliver_group(
     // nesting a runtime there panics; the datagrams wait in the queue, which
     // is registered before the spawn so the next datagram finds it.
     let gen = args.build_gen.fetch_add(1, Ordering::Relaxed);
-    args.building
-        .lock()
-        .insert(peer, (queue.clone(), Instant::now(), gen));
+    {
+        // Second admission check: the integrity gate above can take long
+        // enough for concurrent builds to finish, and the cap must hold
+        // across the whole admission path, not just at its entry.
+        let mut b = args.building.lock();
+        let sessions = args.sessions.lock();
+        if args.limits.max_sessions_per_worker > 0
+            && sessions.len() + b.len() >= args.limits.max_sessions_per_worker
+        {
+            drop(sessions);
+            drop(b);
+            args.stats.session_drops.fetch_add(1, Ordering::Relaxed);
+            for buf in datagrams {
+                recycle_buf(buf);
+            }
+            return;
+        }
+        b.insert(peer, (queue.clone(), Instant::now(), gen));
+    }
     for buf in datagrams {
         if !queue.push(buf, inbox_cap) {
             args.stats.channel_drops.fetch_add(1, Ordering::Relaxed);
@@ -923,6 +1074,8 @@ fn deliver_group(
     let stats = args.stats.clone();
     let config = args.config.clone();
     let testing_build_delay = args.testing_build_delay;
+    let max_sessions = args.limits.max_sessions_per_worker;
+    let queue = queue.clone();
     knet::spawn_task(async move {
         let conn = match KcpStream::with_transport(transport, peer)
             .connected(false)
@@ -964,9 +1117,26 @@ fn deliver_group(
                 return;
             }
             b.remove(&peer);
-            sessions
-                .lock()
-                .insert(peer, Session { conn: conn.clone() });
+            // Final cap check before publish. Several builds that passed
+            // admission together can all finish at once; without this the
+            // published map would overshoot `max_sessions_per_worker`.
+            let mut live = sessions.lock();
+            if max_sessions > 0 && live.len() >= max_sessions {
+                drop(live);
+                drop(b);
+                log::warn!(
+                    "kcp-rs: dropping built session for {peer}: max_sessions_per_worker ({max_sessions}) reached before publish"
+                );
+                conn.close();
+                // The build's queue still holds the handshake datagrams and
+                // its input loop may be parked on it; release the slot's
+                // memory instead of leaving a dead build's backlog pinned.
+                queue.mark_closed();
+                stats.session_drops.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            live.insert(peer, Session { conn: conn.clone() });
+            drop(live);
             // close() drains `pending` and then sets nothing else, so a publish
             // that loses the race removes the session it just inserted. The
             // accept queue is taken after `sessions`: `discard_pending` drops
@@ -998,6 +1168,12 @@ fn deliver_group(
 /// evicting on it would kill live sessions whose ACKs are being lost (the
 /// peer's `una` freezes at 0 and its RTO retransmits segment 0, which is
 /// indistinguishable from a re-dial until more traffic arrives).
+///
+/// P0-6 / M-4: even an *entire* all-stale burst is not enough. Under an ACK
+/// black hole the peer's `snd_una` never advances, its RTO retransmits sn=0
+/// with `una=0`, and if that retransmit is the only unacked datagram the
+/// whole burst looks stale. Requiring N consecutive all-stale bursts (any
+/// live burst resets the streak) is what separates that from a real re-dial.
 fn evict_stale(args: &RxArgs, watched: &mut Vec<(SocketAddr, u64)>) {
     let observed = std::mem::take(watched);
     let mut seen: HashMap<SocketAddr, u64> = HashMap::new();
@@ -1005,6 +1181,7 @@ fn evict_stale(args: &RxArgs, watched: &mut Vec<(SocketAddr, u64)>) {
         let entry = seen.entry(peer).or_insert(u64::MAX);
         *entry = (*entry).min(before);
     }
+    let threshold = args.limits.stale_evict_threshold.max(1);
     for (peer, before) in seen {
         let removed = {
             let mut sessions = args.sessions.lock();
@@ -1012,6 +1189,19 @@ fn evict_stale(args: &RxArgs, watched: &mut Vec<(SocketAddr, u64)>) {
                 continue;
             };
             if session.conn.stale_burst_count() <= before {
+                continue;
+            }
+            // A single all-stale burst can be an ACK-blackhole RTO of sn=0.
+            // Only a sustained streak — spanning both N bursts and a
+            // wall-clock window — means the peer really re-dialed. The time
+            // span stops a forged burst from satisfying the count threshold
+            // in zero time.
+            let now_ms = knet::mono_ms();
+            let first = session.conn.first_stale_ms();
+            if session.conn.consecutive_stale_burst_count() < threshold as u64
+                || first == 0
+                || now_ms.saturating_sub(first) < EVICT_MIN_STALE_SPAN_MS
+            {
                 continue;
             }
             sessions.remove(&peer)
@@ -1111,5 +1301,40 @@ fn sweep(args: &RxArgs) {
     }
     if idle > 0 {
         args.stats.idle_reaps.fetch_add(idle, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    // The per-IP concurrent cap is enforced in `deliver_group` and covered
+    // end-to-end by
+    // `tests/kcpstream_listener.rs::per_ip_session_limit_bounds_admission_from_one_address`.
+
+    /// P1-10: a single IP must not open more than `rate` new sessions per
+    /// second; other IPs are unaffected.
+    #[test]
+    fn per_ip_session_rate_limits_one_host() {
+        let limiter = Mutex::new(HashMap::new());
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let other: IpAddr = "10.0.0.2".parse().unwrap();
+        let rate = 5;
+
+        for i in 0..rate {
+            assert!(
+                allow_new_session(&limiter, ip, rate),
+                "call {i} should be allowed"
+            );
+        }
+        assert!(
+            !allow_new_session(&limiter, ip, rate),
+            "over-budget admission must be refused"
+        );
+        // A different IP is unaffected.
+        assert!(allow_new_session(&limiter, other, rate));
+        // rate=0 disables the limit.
+        assert!(allow_new_session(&limiter, ip, 0));
     }
 }

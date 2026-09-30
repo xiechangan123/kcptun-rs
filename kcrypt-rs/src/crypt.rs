@@ -411,6 +411,22 @@ pub fn select_block_crypt(method: &str, pass: &[u8]) -> (Box<dyn BlockCrypt>, St
     (Box::new(engine), name)
 }
 
+/// Validate a `--crypt` method name (P2 / L-9).
+///
+/// Unknown names used to silently fall back to `aes`. Fail fast instead so a
+/// typo cannot downgrade the cipher without the operator noticing.
+pub fn validate_crypt_method(method: &str) -> Result<(), String> {
+    match method {
+        "null" | "none" | "xor" | "aes" | "aes-128" | "aes-192" | "aes-256" | "aes-128-gcm"
+        | "sm4" | "tea" | "xtea" | "salsa20" | "salsa" | "blowfish" | "twofish" | "cast5"
+        | "3des" | "tripledes" => Ok(()),
+        other => Err(format!(
+            "unknown --crypt {other:?} (valid: aes, aes-128, aes-192, aes-256, aes-128-gcm, \
+             sm4, tea, xtea, salsa20, blowfish, twofish, cast5, 3des, xor, none, null)"
+        )),
+    }
+}
+
 /// Select an [`AeadCrypt`] if the method is an AEAD variant.
 ///
 /// Returns `None` for non-AEAD methods.
@@ -429,7 +445,6 @@ pub fn select_aead_crypt(method: &str, pass: &[u8]) -> Option<Box<dyn AeadCrypt>
 /// Prefer this over `dyn BlockCrypt` on the encrypt hot path when the
 /// method is known at session start — eliminates vtable calls while keeping
 /// object-safe [`BlockCrypt`] for existing APIs.
-#[derive(Debug)]
 pub enum CryptEngine {
     None(NoneCrypt),
     Xor(SimpleXORCrypt),
@@ -443,6 +458,15 @@ pub enum CryptEngine {
     Twofish(TwofishCrypt),
     Cast5(Cast5Crypt),
     TripleDes(TripleDesCrypt),
+}
+
+impl std::fmt::Debug for CryptEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the inner cipher: even a redacted inner Debug would
+        // leak the variant (and thus the algorithm) through the derived
+        // form. Operators already know the method from the config.
+        f.write_str("CryptEngine { .. }")
+    }
 }
 
 impl CryptEngine {
@@ -488,7 +512,7 @@ impl CryptEngine {
                 "salsa20".to_string(),
             ),
             "blowfish" => (
-                CryptEngine::Blowfish(BlowfishCrypt::new(pass)),
+                CryptEngine::Blowfish(BlowfishCrypt::new(pass).expect("blowfish key length")),
                 method.to_string(),
             ),
             "twofish" => (
@@ -496,7 +520,11 @@ impl CryptEngine {
                 method.to_string(),
             ),
             "cast5" => (
-                CryptEngine::Cast5(Cast5Crypt::new(&pad(pass, 16))),
+                // `pad` always yields exactly 16 bytes; Cast5Crypt::new is
+                // fail-fast on any other length (P1-5 / M-10).
+                CryptEngine::Cast5(
+                    Cast5Crypt::new(&pad(pass, 16)).expect("pad() yields a 16-byte CAST5 key"),
+                ),
                 method.to_string(),
             ),
             "3des" | "tripledes" => (
@@ -630,6 +658,12 @@ mod tests {
             "3des",
         ] {
             let (c, n) = select_block_crypt(m, b"test-key-12345");
+            // P2 / L-7: AEAD now panics on the BlockCrypt interface (matching
+            // Go). Roundtrip via BlockCrypt only for the CFB/stream family.
+            if n == "aes-128-gcm" {
+                assert_eq!(c.name(), "aes-128-gcm");
+                continue;
+            }
             let mut d = b"test data!".to_vec();
             let o = d.clone();
             c.encrypt(&mut d);
@@ -652,6 +686,67 @@ mod tests {
             eng.decrypt(&mut b);
             assert_eq!(a, b, "decrypt mismatch for {}", m);
             assert_eq!(&a, b"hello static dispatch!");
+        }
+    }
+
+    // ─── Debug must not leak key material (M-12 / L-8 rework) ───────────
+
+    /// Every key-bearing cipher prints its type name only. The marker byte
+    /// 0xAB surfaces as `171, 171` in a derived `Debug` of byte arrays, so
+    /// the control assertion proves these checks cannot pass vacuously.
+    #[test]
+    fn debug_output_redacts_key_material() {
+        let key = [0xABu8; 32];
+        let key16 = [0xABu8; 16];
+        // Control: a derived Debug of raw key bytes carries the marker.
+        assert!(format!("{:?}", key).contains("171, 171"));
+
+        let redacted: Vec<String> = vec![
+            format!("{:?}", Salsa20Crypt::new(&key)),
+            format!("{:?}", SimpleXORCrypt::new(&key)),
+            format!("{:?}", TeaCrypt::new(&key)),
+            format!("{:?}", Sm4Crypt::new(&key)),
+            format!("{:?}", XteaCrypt::new(&key)),
+            format!("{:?}", AesCfbCrypt::new(&key)),
+            format!("{:?}", TwofishCrypt::new(&key)),
+            format!("{:?}", Cast5Crypt::new(&key16).unwrap()),
+            format!("{:?}", crate::cast5::Cast5Cipher::new(&key16).unwrap()),
+        ];
+        for s in &redacted {
+            assert!(!s.contains("abab"), "hex marker leaked: {s}");
+            assert!(!s.contains("171, 171"), "decimal marker leaked: {s}");
+            assert!(s.contains("Crypt") || s.contains("Cipher"), "form: {s}");
+        }
+    }
+
+    /// The engine wraps every cipher; its Debug must not print any of them.
+    #[test]
+    fn crypt_engine_debug_redacts_key_material() {
+        let key = [0xABu8; 32];
+        for m in [
+            "null",
+            "none",
+            "xor",
+            "aes-128",
+            "aes-192",
+            "aes",
+            "aes-128-gcm",
+            "sm4",
+            "tea",
+            "xtea",
+            "salsa20",
+            "blowfish",
+            "twofish",
+            "cast5",
+            "3des",
+        ] {
+            let (eng, _) = CryptEngine::select(m, &key);
+            let s = format!("{:?}", eng);
+            assert_eq!(s, "CryptEngine { .. }", "engine Debug form changed for {m}");
+            assert!(
+                !s.contains("abab") && !s.contains("171, 171"),
+                "{m} leaks key material"
+            );
         }
     }
 }

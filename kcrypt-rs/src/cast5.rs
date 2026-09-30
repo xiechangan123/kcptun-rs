@@ -425,10 +425,24 @@ fn f3(d: u32, m: u32, r: u8) -> u32 {
 }
 
 /// CAST5 (CAST-128) block cipher. Compatible with Go's golang.org/x/crypto/cast5.
-#[derive(Debug)]
 pub struct Cast5Cipher {
     masking: [u32; 16],
     rotate: [u8; 16],
+}
+
+impl std::fmt::Debug for Cast5Cipher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Type name only: `masking`/`rotate` are the key schedule.
+        f.write_str("Cast5Cipher { .. }")
+    }
+}
+
+impl Drop for Cast5Cipher {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.masking.zeroize();
+        self.rotate.zeroize();
+    }
 }
 
 impl Cast5Cipher {

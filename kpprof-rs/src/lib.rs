@@ -197,6 +197,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+/// At most one CPU profile in flight (P1-7 / M-14). A second concurrent
+/// request would occupy another thread for up to 300s and starve crypto
+/// offload; it is rejected with 429 instead.
+static PROFILE_BUSY: AtomicBool = AtomicBool::new(false);
+
 #[cfg(unix)]
 use pprof::protos::{self as protos, Message};
 
@@ -352,6 +357,20 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
                 .await;
                 continue;
             }
+            // P1-7 / M-14: at most one CPU profile in flight. A second
+            // request would otherwise occupy another shared-pool thread for
+            // up to 300s and starve crypto offload.
+            if PROFILE_BUSY.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                respond(
+                    &mut stream,
+                    "429 Too Many Requests",
+                    "text/plain; charset=utf-8",
+                    "",
+                    b"cpu profile already in progress\n",
+                )
+                .await;
+                continue;
+            }
             let mut seconds: u64 = 30;
             for part in query.split('&') {
                 if let Some(v) = part.strip_prefix("seconds=") {
@@ -362,34 +381,75 @@ pub async fn run_pprof(addr: &str, stop: Arc<AtomicBool>) -> Result<()> {
             }
             log::info!("pprof CPU profile {}s peer={}", seconds, peer);
 
-            let profile_result =
-                knet::cpu_block(move || -> std::result::Result<Vec<u8>, String> {
-                    let builder = pprof::ProfilerGuardBuilder::default().frequency(997);
-                    #[cfg(any(
-                        target_arch = "x86_64",
-                        target_arch = "aarch64",
-                        target_arch = "riscv64",
-                        target_arch = "loongarch64"
-                    ))]
-                    let builder = builder.blocklist(&["libc", "libgcc", "pthread", "vdso"]);
-                    let guard = builder
-                        .build()
-                        .map_err(|e| format!("profiler start failed: {e}"))?;
-                    std::thread::sleep(Duration::from_secs(seconds));
-                    let report = guard
-                        .report()
-                        .build()
-                        .map_err(|e| format!("report build failed: {e}"))?;
-                    let profile = report
-                        .pprof()
-                        .map_err(|e| format!("build pprof failed: {e}"))?;
-                    let mut content = Vec::new();
-                    profile
-                        .write_to_vec(&mut content)
-                        .map_err(|e| format!("encode pprof failed: {e}"))?;
-                    Ok(content)
-                })
+            // Dedicated OS thread, NOT `cpu_block`: the profile body blocks
+            // for `seconds` and must not occupy the shared 2–8 thread
+            // offload pool that crypto rides on.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let spawn_result =
+                std::thread::Builder::new()
+                    .name("kpprof-cpu".into())
+                    .spawn(move || {
+                        let result = (|| -> std::result::Result<Vec<u8>, String> {
+                            let builder = pprof::ProfilerGuardBuilder::default().frequency(997);
+                            #[cfg(any(
+                                target_arch = "x86_64",
+                                target_arch = "aarch64",
+                                target_arch = "riscv64",
+                                target_arch = "loongarch64"
+                            ))]
+                            let builder = builder.blocklist(&["libc", "libgcc", "pthread", "vdso"]);
+                            let guard = builder
+                                .build()
+                                .map_err(|e| format!("profiler start failed: {e}"))?;
+                            std::thread::sleep(Duration::from_secs(seconds));
+                            let report = guard
+                                .report()
+                                .build()
+                                .map_err(|e| format!("report build failed: {e}"))?;
+                            let profile = report
+                                .pprof()
+                                .map_err(|e| format!("build pprof failed: {e}"))?;
+                            let mut content = Vec::new();
+                            profile
+                                .write_to_vec(&mut content)
+                                .map_err(|e| format!("encode pprof failed: {e}"))?;
+                            Ok(content)
+                        })();
+                        let _ = tx.send(result);
+                    });
+            if let Err(e) = spawn_result {
+                PROFILE_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
+                respond(
+                    &mut stream,
+                    "500 Internal Server Error",
+                    "text/plain; charset=utf-8",
+                    "",
+                    format!("spawn profiler thread: {e}\n").as_bytes(),
+                )
                 .await;
+                continue;
+            }
+
+            // Wait for the dedicated thread without blocking the runtime's
+            // worker forever: poll the channel on a timer.
+            let deadline = std::time::Instant::now() + Duration::from_secs(seconds + 10);
+            let profile_result = loop {
+                match rx.try_recv() {
+                    Ok(r) => break r,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        if std::time::Instant::now() >= deadline {
+                            PROFILE_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
+                            break Err("profiler timed out".to_string());
+                        }
+                        knet::sleep_ms(50).await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        PROFILE_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
+                        break Err("profiler thread vanished".to_string());
+                    }
+                }
+            };
+            PROFILE_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
 
             let profile_bytes = match profile_result {
                 Ok(bytes) => bytes,

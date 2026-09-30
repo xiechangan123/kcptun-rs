@@ -312,3 +312,65 @@ fn bench_spawn_task_throughput() {
         );
     });
 }
+
+// ─── ctrl_c must fire on SIGTERM (P0-2 / H-2) ────────────────────────────────
+/// `docker stop` / `systemd stop` / k8s termination deliver SIGTERM, not
+/// SIGINT. Without a SIGTERM handler the process is killed by the kernel and
+/// the graceful-shutdown path never runs.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_ctrl_c_fires_on_sigterm() {
+    // Drive `ctrl_c()` on a task, then raise SIGTERM against this process.
+    // `ctrl_c()` installs the handler on first call, so give it a beat first.
+    let handle = spawn_task(async { ctrl_c().await });
+
+    // Wait until the handler is installed (ctrl_c polls every 100ms; the
+    // Once::call_once runs before the first poll).
+    sleep_ms(50).await;
+
+    // SAFETY: raise() only delivers a signal to this process; the handler
+    // installed by ctrl_c() just stores an atomic flag.
+    unsafe {
+        libc::raise(libc::SIGTERM);
+    }
+
+    let result = timeout(std::time::Duration::from_secs(2), handle).await;
+    assert!(
+        result.is_ok() && result.unwrap().is_ok(),
+        "ctrl_c() must return after SIGTERM within 2s"
+    );
+}
+
+// ─── inflight tracker (P1-2 / M-7) ───────────────────────────────────────────
+#[tokio::test]
+async fn test_inflight_guard_tracks_and_drains() {
+    use std::time::Duration;
+
+    assert_eq!(crate::inflight::active(), 0);
+    {
+        let _g = crate::inflight::guard();
+        assert_eq!(crate::inflight::active(), 1);
+    }
+    assert_eq!(crate::inflight::active(), 0);
+
+    // A live task keeps the count up; wait_drain returns true once it finishes.
+    let handle = spawn_task(async {
+        let _g = crate::inflight::guard();
+        sleep_ms(80).await;
+    });
+    assert!(crate::inflight::wait_drain(Duration::from_secs(2)).await);
+    let _ = handle.await;
+    assert_eq!(crate::inflight::active(), 0);
+}
+
+#[tokio::test]
+async fn test_inflight_wait_drain_times_out() {
+    use std::time::Duration;
+
+    let _g = crate::inflight::guard();
+    let ok = crate::inflight::wait_drain(Duration::from_millis(50)).await;
+    assert!(
+        !ok,
+        "wait_drain must report timeout while a task is still live"
+    );
+}

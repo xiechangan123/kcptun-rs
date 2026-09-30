@@ -181,6 +181,13 @@ pub struct Stream {
     /// Peer's advertised receive window size (from UPD).
     /// Initialized to 256 KiB matching Go `initialPeerWindow`.
     peer_window: AtomicU32,
+    /// Set by [`Self::disable_peer_window`] (SMUX v1). A sentinel `u32::MAX`
+    /// in `peer_window` is a magic value, not a flag: without this field a
+    /// stray/foreign UPD carrying `window = 0` could overwrite it and wedge
+    /// every writer on the stream forever. The flag makes the v1 state
+    /// durable against any `apply_peer_update` — defence in depth on top of
+    /// the session-level version gate (M-1).
+    peer_window_disabled: AtomicBool,
     /// Bytes handed to the reader since the session last reclaimed them.
     /// The session decrements its token bucket when a frame is buffered and
     /// adds these back once the application has consumed them (Go returns
@@ -231,6 +238,7 @@ impl Stream {
             pending_upd: AtomicBool::new(false),
             peer_consumed: AtomicU32::new(0),
             peer_window: AtomicU32::new(262144), // Go initialPeerWindow
+            peer_window_disabled: AtomicBool::new(false),
             tokens_to_return: AtomicUsize::new(0),
             ch_reader_wakeup: knet::Notify::new(),
             ch_write_wakeup: knet::Notify::new(),
@@ -749,6 +757,11 @@ impl Stream {
 
     /// Apply a peer UPD frame (consumed + window) — matching Go `stream.update`.
     pub fn apply_peer_update(&self, consumed: u32, window: u32) {
+        // A disabled window (v1) has no state a UPD could update; honoring
+        // the frame could only destroy the unlimited window.
+        if self.peer_window_disabled.load(Ordering::Acquire) {
+            return;
+        }
         let old_effective = self.peer_send_window();
         self.peer_consumed.store(consumed, Ordering::Release);
         self.peer_window.store(window, Ordering::Release);
@@ -759,12 +772,20 @@ impl Stream {
 
     /// Disable write-side peer window (SMUX v1 has no UPD / no per-stream window).
     pub fn disable_peer_window(&self) {
+        // The flag is the real state; the sentinel write stays so anything
+        // still reading `peer_window` directly keeps seeing "unlimited".
+        self.peer_window_disabled.store(true, Ordering::Release);
         self.peer_consumed.store(0, Ordering::Release);
         self.peer_window.store(u32::MAX, Ordering::Release);
     }
 
     /// Remaining send window toward the peer (v2 flow control).
     pub fn peer_send_window(&self) -> u32 {
+        // v1: no per-stream window on the wire — always unlimited, regardless
+        // of what a stray UPD may have written into `peer_window`.
+        if self.peer_window_disabled.load(Ordering::Acquire) {
+            return u32::MAX;
+        }
         let window = self.peer_window.load(Ordering::Acquire);
         if window == u32::MAX {
             return u32::MAX;

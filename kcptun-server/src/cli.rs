@@ -18,7 +18,7 @@ fn normalize_go_alias(arg: std::ffi::OsString) -> std::ffi::OsString {
 /// fields are unsigned and cannot be negative. Negatives are clamped to zero
 /// when applied to the KCP/SMUX config.
 #[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct Config {
     pub listen: Option<String>,
     pub target: Option<String>,
@@ -53,6 +53,14 @@ pub(crate) struct Config {
     pub quiet: Option<bool>,
     pub tcp: Option<bool>,
     pub pprof: Option<bool>,
+    /// SO_REUSEPORT shard count (same semantics as `--shards`).
+    pub shards: Option<u32>,
+    /// Per-IP new-session rate limit (same semantics as `--peripsessionrate`).
+    pub peripsessionrate: Option<u32>,
+    /// Per-IP concurrent session cap (same semantics as `--maxsessionsperip`).
+    pub maxsessionsperip: Option<usize>,
+    /// pprof bind address (same semantics as `--pprofaddr`).
+    pub pprofaddr: Option<String>,
     #[cfg(feature = "qpp")]
     pub qpp: Option<bool>,
     #[cfg(feature = "qpp")]
@@ -84,6 +92,8 @@ pub(crate) struct Cli {
 
     /// Encryption method: aes, aes-128, aes-128-gcm, aes-192, salsa20, blowfish,
     /// twofish, cast5, 3des, tea, xtea, xor, sm4, none, null.
+    /// Only aes-128-gcm is authenticated — prefer it for production. The CFB
+    /// family is CRC32-only (forgeable). xor/none/null are debug-only.
     #[arg(long, default_value = "aes")]
     pub crypt: Option<String>,
 
@@ -234,8 +244,25 @@ pub(crate) struct Cli {
     /// contention). `0` (default) = platform-aware: Linux → number of logical
     /// CPUs (kernel hashes peers across shards → parallel); non-Linux → 1
     /// (single socket + one worker). `1` forces a single socket + one worker.
+    /// Hard maximum is 64 — larger values exhaust threads/fds and used to
+    /// abort the process via `expect`.
     #[arg(long, default_value_t = 0)]
     pub shards: u32,
+
+    /// Max new sessions per second from one source IP (0 = unlimited).
+    /// Defence-in-depth against a single host burning the session budget.
+    #[arg(long, default_value_t = 20)]
+    pub peripsessionrate: u32,
+
+    /// Max concurrent sessions (published + building) per source IP
+    /// (0 = unlimited). Opt-in; leave 0 behind a NAT / shared egress IP.
+    #[arg(long, default_value_t = 0)]
+    pub maxsessionsperip: usize,
+
+    /// pprof HTTP bind address (default 127.0.0.1:6060, loopback only).
+    /// Use e.g. `0.0.0.0:6060` to restore Go kcptun's all-interfaces bind.
+    #[arg(long, default_value = "127.0.0.1:6060")]
+    pub pprofaddr: String,
 }
 
 impl Cli {
@@ -285,7 +312,10 @@ impl Cli {
             qppcount: cfg.qppcount.or(cli.qppcount),
             c: cli.c,
             version_flag: false,
-            shards: cli.shards,
+            shards: cfg.shards.unwrap_or(cli.shards),
+            peripsessionrate: cfg.peripsessionrate.unwrap_or(cli.peripsessionrate),
+            maxsessionsperip: cfg.maxsessionsperip.unwrap_or(cli.maxsessionsperip),
+            pprofaddr: cfg.pprofaddr.unwrap_or(cli.pprofaddr),
         }
     }
 }
@@ -295,19 +325,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn json_false_overrides_cli_true_and_unknown_fields_are_ignored() {
+    fn json_false_overrides_cli_true_and_unknown_fields_are_rejected() {
         let cli = Cli::try_parse_from(["kcptun-server", "--tcp", "--nocomp", "--quiet", "--pprof"])
             .unwrap();
-        let cfg: Config = serde_json::from_str(
-            r#"{"tcp":false,"nocomp":false,"quiet":false,"pprof":false,"future":1}"#,
-        )
-        .unwrap();
+        // P1-1 / M-6: `deny_unknown_fields` — a typo like "shard" must not
+        // silently fall back to the CLI default the way `shards` used to.
+        assert!(
+            serde_json::from_str::<Config>(r#"{"shard":4}"#).is_err(),
+            "misspelled fields must fail fast"
+        );
+        let cfg: Config =
+            serde_json::from_str(r#"{"tcp":false,"nocomp":false,"quiet":false,"pprof":false}"#)
+                .unwrap();
 
         let merged = Cli::merge(cli, cfg);
         assert!(!merged.tcp);
         assert!(!merged.nocomp);
         assert!(!merged.quiet);
         assert!(!merged.pprof);
+    }
+
+    /// P1-1 / M-6: JSON `"shards"` must actually take effect.
+    #[test]
+    fn json_shards_field_is_merged() {
+        let cli = Cli::try_parse_from(["kcptun-server", "--shards", "8"]).unwrap();
+        assert_eq!(cli.shards, 8);
+        let cfg: Config = serde_json::from_str(r#"{"shards":4}"#).unwrap();
+        let merged = Cli::merge(cli, cfg);
+        assert_eq!(merged.shards, 4, "JSON shards must override the CLI value");
+
+        let cli = Cli::try_parse_from(["kcptun-server"]).unwrap();
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        let merged = Cli::merge(cli, cfg);
+        assert_eq!(merged.shards, 0, "absent JSON shards keeps the CLI default");
     }
 
     #[test]

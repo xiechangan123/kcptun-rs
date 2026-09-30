@@ -138,10 +138,13 @@ impl AeadCrypt for Aes128GcmCrypt {
 
 impl BlockCrypt for Aes128GcmCrypt {
     fn encrypt(&self, _data: &mut [u8]) {
-        // AEAD doesn't use the BlockCrypt in-place interface.
-        // Use AeadCrypt::seal/open instead.
+        // P2 / L-7: Go's AEAD cipher panics if the BlockCrypt interface is
+        // used. A silent no-op used to drop data without anyone noticing.
+        panic!("called Encrypt on AEAD crypt; use AeadCrypt::seal");
     }
-    fn decrypt(&self, _data: &mut [u8]) {}
+    fn decrypt(&self, _data: &mut [u8]) {
+        panic!("called Decrypt on AEAD crypt; use AeadCrypt::open");
+    }
     fn name(&self) -> &'static str {
         "aes-128-gcm"
     }

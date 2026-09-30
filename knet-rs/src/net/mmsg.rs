@@ -233,16 +233,35 @@ pub fn recvmmsg_from(
             return Err(io::Error::last_os_error());
         }
         let got = ret as usize;
+        // L-10 rework: compact valid slots to the front. A truncated
+        // datagram (MSG_TRUNC) is not a valid packet — dropping it in place
+        // with len=0 kept positional alignment but injected a fake
+        // zero-length datagram into the caller's burst/stale accounting.
+        // Compacting + returning only real entries fixes both.
         let mut out = Vec::with_capacity(got);
-        for (i, b) in bufs.iter_mut().take(got).enumerate() {
+        let mut w = 0usize;
+        for i in 0..got {
+            let truncated = (s.msgs[i].msg_hdr.msg_flags & libc::MSG_TRUNC) != 0;
             let len = s.msgs[i].msg_len as usize;
-            unsafe {
-                b.set_len(len);
-            }
             let addr = sockaddr_storage_to_addr(&s.names[i], s.msgs[i].msg_hdr.msg_namelen);
+            if truncated {
+                // Dropped: never surfaces upstream, never occupies a slot.
+                unsafe {
+                    bufs[i].set_len(0);
+                }
+                continue;
+            }
+            // Move this buffer to the write cursor so bufs[w] pairs with out[w].
+            if w != i {
+                bufs.swap(w, i);
+            }
+            unsafe {
+                bufs[w].set_len(len);
+            }
             out.push((len, addr));
+            w += 1;
         }
-        for b in bufs.iter_mut().skip(got).take(n - got) {
+        for b in bufs.iter_mut().skip(w).take(n.saturating_sub(w)) {
             unsafe {
                 b.set_len(0);
             }
@@ -319,25 +338,47 @@ pub fn recvmmsg_from_into(
             return Err(io::Error::last_os_error());
         }
         let got = ret as usize;
+        // L-10 rework: compact valid (non-truncated, parseable) entries to
+        // the front of BOTH `bufs` and `peers` and return the reduced count.
+        // The len=0 placeholder previously kept alignment but polluted the
+        // caller's burst/stale accounting with fake zero-length datagrams.
         peers.clear();
-        for (i, b) in bufs.iter_mut().take(got).enumerate() {
+        let mut w = 0usize;
+        for i in 0..got {
+            let truncated = (s.msgs[i].msg_hdr.msg_flags & libc::MSG_TRUNC) != 0;
             let len = s.msgs[i].msg_len as usize;
-            unsafe {
-                b.set_len(len);
-            }
             // Unconnected recvmmsg always fills msg_name (msg_name was set
             // above), so sockaddr_storage_to_addr is Some for UDP.
-            if let Some(addr) = sockaddr_storage_to_addr(&s.names[i], s.msgs[i].msg_hdr.msg_namelen)
-            {
+            let addr = sockaddr_storage_to_addr(&s.names[i], s.msgs[i].msg_hdr.msg_namelen);
+            if truncated {
+                unsafe {
+                    bufs[i].set_len(0);
+                }
+                continue;
+            }
+            if w != i {
+                bufs.swap(w, i);
+            }
+            unsafe {
+                bufs[w].set_len(len);
+            }
+            // Keep peers[w] paired with bufs[w]; a missing addr is dropped
+            // as a whole entry (same as the caller's previous Some() filter).
+            if let Some(addr) = addr {
                 peers.push(addr);
+                w += 1;
+            } else {
+                unsafe {
+                    bufs[w].set_len(0);
+                }
             }
         }
-        for b in bufs.iter_mut().skip(got).take(n - got) {
+        for b in bufs.iter_mut().skip(w).take(n.saturating_sub(w)) {
             unsafe {
                 b.set_len(0);
             }
         }
-        Ok(got)
+        Ok(w)
     })
 }
 
@@ -394,18 +435,32 @@ pub fn recvmmsg_connected(fd: RawFd, bufs: &mut [Vec<u8>]) -> io::Result<usize> 
             return Err(io::Error::last_os_error());
         }
         let got = ret as usize;
-        for (i, b) in bufs.iter_mut().take(got).enumerate() {
+        // L-10 rework: compact valid slots to the front; drop truncated ones
+        // entirely so they never surface as zero-length datagrams.
+        let mut w = 0usize;
+        for i in 0..got {
+            let truncated = (s.msgs[i].msg_hdr.msg_flags & libc::MSG_TRUNC) != 0;
             let len = s.msgs[i].msg_len as usize;
-            unsafe {
-                b.set_len(len);
+            if truncated {
+                unsafe {
+                    bufs[i].set_len(0);
+                }
+                continue;
             }
+            if w != i {
+                bufs.swap(w, i);
+            }
+            unsafe {
+                bufs[w].set_len(len);
+            }
+            w += 1;
         }
-        for b in bufs.iter_mut().skip(got).take(n - got) {
+        for b in bufs.iter_mut().skip(w).take(n.saturating_sub(w)) {
             unsafe {
                 b.set_len(0);
             }
         }
-        Ok(got)
+        Ok(w)
     })
 }
 
@@ -492,5 +547,89 @@ mod tests {
             assert_eq!(*len, 1);
             assert!(peer.is_some());
         }
+    }
+
+    /// L-10 rework: a datagram larger than the iovec is truncated by the
+    /// kernel (`MSG_TRUNC`) and must be dropped entirely — not surfaced as a
+    /// zero-length slot that would pollute the caller's burst accounting.
+    /// A subsequent valid datagram must still arrive in its own slot.
+    #[test]
+    fn recvmmsg_drops_truncated_and_keeps_valid() {
+        let recv = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let send = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let recv_addr = recv.local_addr().unwrap();
+
+        // 3000 bytes > the 2048-byte iovec the codec reserves → MSG_TRUNC.
+        let big = vec![0xA5u8; 3000];
+        let small = b"ok".to_vec();
+        send.send_to(&big, recv_addr).unwrap();
+        send.send_to(&small, recv_addr).unwrap();
+
+        // Drain whatever the kernel has queued. The truncated datagram must
+        // never appear; the valid one must.
+        let mut bufs = vec![vec![0u8; 0]; 4];
+        let mut saw_valid = false;
+        let mut saw_truncated = false;
+        for _ in 0..32 {
+            let out = recvmmsg_from(recv.as_raw_fd(), &mut bufs).unwrap();
+            for (len, _peer) in &out {
+                if *len == 0 {
+                    saw_truncated = true;
+                }
+                if *len == 2 {
+                    saw_valid = true;
+                }
+                // A truncated 3000-byte datagram is capped at the iovec
+                // size (2048) when the kernel reports msg_len; anything
+                // ≥ 2048 here would mean the drop failed.
+                assert!(*len < 2048, "truncated datagram leaked at len={len}");
+            }
+            if saw_valid {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(saw_valid, "the valid datagram must still arrive");
+        assert!(
+            !saw_truncated,
+            "MSG_TRUNC datagram must be dropped, not surfaced as len=0"
+        );
+    }
+
+    /// Same contract for `recvmmsg_from_into`: truncated slots are compacted
+    /// away so `peers[i]` stays paired with `bufs[i]`, and the returned count
+    /// reflects only real datagrams.
+    #[test]
+    fn recvmmsg_from_into_compacts_truncated() {
+        let recv = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let send = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let recv_addr = recv.local_addr().unwrap();
+
+        let big = vec![0x5Au8; 3000];
+        let small = b"hi".to_vec();
+        send.send_to(&big, recv_addr).unwrap();
+        send.send_to(&small, recv_addr).unwrap();
+
+        let mut bufs = vec![vec![0u8; 0]; 4];
+        let mut peers = Vec::new();
+        let mut got_valid = 0usize;
+        for _ in 0..32 {
+            let n = recvmmsg_from_into(recv.as_raw_fd(), &mut bufs, &mut peers).unwrap();
+            assert_eq!(n, peers.len(), "count must match peers (compaction)");
+            for i in 0..n {
+                // Compaction invariant: bufs[i] and peers[i] describe the
+                // same datagram, and every surviving slot is non-empty.
+                assert!(bufs[i].len() < 2048, "truncated slot leaked at {i}");
+                assert!(!bufs[i].is_empty(), "empty slot survived compaction");
+                if bufs[i].len() == 2 {
+                    got_valid += 1;
+                }
+            }
+            if got_valid > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(got_valid > 0, "valid datagram must survive compaction");
     }
 }

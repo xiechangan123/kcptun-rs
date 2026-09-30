@@ -69,7 +69,7 @@ kcptun-rs **outperforms Go kcptun across nearly every cipher and compression set
 | Category | Details |
 |----------|---------|
 | **Compatibility** | Full wire-compatible with Go kcptun (kcp-go v5) — all ciphers, modes, SMUX versions, FEC, Snappy |
-| **Encryption** | 14 backends: `null`, `none`, `xor`, `aes-128`, `aes-192`, `aes`(256), `aes-128-gcm`, `sm4`, `tea`, `xtea`, `salsa20`, `blowfish`, `twofish`, `cast5`, `3des` |
+| **Encryption** | 14 backends: `null`, `none`, `xor`, `aes-128`, `aes-192`, `aes`(256), `aes-128-gcm`, `sm4`, `tea`, `xtea`, `salsa20`, `blowfish`, `twofish`, `cast5`, `3des` — see [Cipher authentication](#cipher-authentication) |
 | **KCP Modes** | `normal`, `fast`, `fast2`, `fast3` |
 | **SMUX** | v1 & v2 multiplexing — multiple TCP streams over a single KCP connection |
 | **FEC** | Reed-Solomon forward error correction (Go-compatible 10/3 default) |
@@ -81,6 +81,27 @@ kcptun-rs **outperforms Go kcptun across nearly every cipher and compression set
 | **SNMP Stats** | Go-compatible SNMP fields with zero-cost opt-in collection |
 | **Cross-Compile** | ARMv7 (Raspberry Pi), ARM64 (Graviton), Linux musl — all from macOS |
 | **Logging** | Structured log levels (RUST_LOG), optional file logging |
+
+---
+
+## 🔐 Cipher authentication
+
+Only `aes-128-gcm` authenticates its ciphertext (AEAD). Every other backend
+uses CFB (or a stream XOR) with a CRC32 integrity check and **no MAC** — a
+network attacker can forge or tamper with packets. This is inherited from Go
+kcptun's wire format and cannot be changed without breaking compatibility.
+
+| Cipher | Authenticated | Notes |
+|--------|---------------|-------|
+| `aes-128-gcm` | ✅ **yes** | AEAD; **recommended for production** |
+| `aes`, `aes-128`, `aes-192` | ❌ no | CFB + CRC32 only |
+| `sm4`, `tea`, `xtea`, `salsa20` | ❌ no | CFB/stream + CRC32 only |
+| `blowfish`, `twofish`, `cast5`, `3des` | ❌ no | CFB + CRC32 only |
+| `xor` | ❌ no | **Debug only — never production** |
+| `none`, `null` | ❌ no | **Debug only — never production** |
+
+`--crypt` is listed as `aes` by default; prefer `--crypt aes-128-gcm` when
+both ends support it.
 
 ---
 
@@ -126,6 +147,12 @@ kcptun-client -c config.json
 ```
 
 > ⚠️ **`--key`, `--crypt`, `--mode`, and `--nocomp` must match between server and client.** Compression is enabled by default.
+
+**JSON config rules (audit hardening):**
+- JSON values take priority over CLI flags.
+- **Unknown fields are rejected** (`deny_unknown_fields`) — a typo like `"shard"` instead of `"shards"` fails at startup instead of being silently ignored.
+- Server-only `"shards"` is a real field (same semantics as `--shards`).
+- Invalid values fail fast at startup: `--crypt` must be a known method, `--mtu` must be ≥ 50, `--dscp` must be 0–63, `--conn` ≤ 256, `--shards` ≤ 64.
 
 ---
 
@@ -512,6 +539,8 @@ so there is no shared-fd send contention.
 
 - Default (`--shards 0`): one shard per logical CPU on **Linux**; a single
   shard elsewhere (macOS does not distribute UDP via SO_REUSEPORT).
+- **Hard max 64**: each shard is one OS thread + one bound UDP socket; larger
+  values fail at startup (they used to `expect`-panic and abort the process).
 - Rule of thumb: **shards ≈ vCPUs**. On a 1–2 vCPU box keep 1 shard — every
   extra worker only adds cross-core wakeups on the same core (the N=2 reuseport
   path is verified correct, but on a single vCPU it is strictly slower).
@@ -667,14 +696,15 @@ re-attempted):
 | `-l` / `--localaddr` | `:12948` | Local listening address |
 | `-r` / `--remoteaddr` | (required) | KCP server address |
 | `--key` | `it's a secrect` | Pre-shared secret |
-| `--crypt` | `aes` | Encryption algorithm |
+| `--crypt` | `aes` | Encryption algorithm. Unknown names fail at startup. Prefer `aes-128-gcm` (only authenticated cipher) |
 | `--mode` | `fast` | KCP mode |
-| `--conn` | `1` | Number of UDP connections |
-| `--mtu` | `1350` | Maximum transmission unit |
+| `--conn` | `1` | Number of UDP connections (**1–256**; larger values are rejected) |
+| `--mtu` | `1350` | Maximum transmission unit (**≥ 50**; invalid values fail at startup, no silent fallback) |
 | `--sndwnd` | `1024` | Send window |
 | `--rcvwnd` | `1024` | Receive window |
 | `--datashard` | `0` | FEC data shards |
 | `--parityshard` | `0` | FEC parity shards |
+| `--dscp` | `0` | DSCP for IP packets (**0–63**) |
 | `--ratelimit` | `0` | Rate limit (bytes/sec) |
 | `--nocomp` | `false` | Disable Snappy compression |
 | `--smuxver` | `2` | SMUX version (1 or 2) |
@@ -687,10 +717,15 @@ re-attempted):
 |:-----|:--------|:------------|
 | `-l` / `--listen` | `:29900` | KCP listen address |
 | `-t` / `--target` | (required) | TCP target address |
-| `--shards` | `0` (auto: per-CPU on Linux, 1 elsewhere) | SO_REUSEPORT shard sockets — each shard is its own socket + worker thread (see the Latency Tuning Guide below) |
+| `--shards` | `0` (auto: per-CPU on Linux, 1 elsewhere) | SO_REUSEPORT shard sockets — each shard is its own socket + worker thread. **Hard max 64** (larger values used to abort the process) |
 | `--key` | `it's a secrect` | Pre-shared secret |
-| `--crypt` | `aes` | Encryption (same as client) |
+| `--crypt` | `aes` | Encryption (same as client). Unknown names fail at startup |
+| `--dscp` | `0` | DSCP for IP packets (**0–63**) |
 | `--mode` | `fast` | KCP mode |
+| `--pprof` | `false` | HTTP pprof (loopback by default; one CPU profile at a time, extra requests get 429) |
+| `--pprofaddr` | `127.0.0.1:6060` | pprof bind address. Use `0.0.0.0:6060` to restore Go kcptun's all-interfaces bind |
+| `--peripsessionrate` | `20` | Max new sessions/sec per source IP (0 = unlimited) |
+| `--maxsessionsperip` | `0` | Max concurrent sessions per source IP (0 = unlimited; leave 0 behind NAT) |
 
 ---
 

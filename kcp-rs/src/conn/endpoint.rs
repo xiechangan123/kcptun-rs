@@ -104,6 +104,17 @@ pub(crate) struct SharedIoState {
     /// burst of fresh data does not count: a late retransmission must not
     /// evict a live session.
     pub(crate) stale_bursts: AtomicU64,
+    /// Consecutive all-stale bursts, reset to 0 by any burst that carried
+    /// live data. Eviction requires this to reach a threshold (P0-6 / M-4):
+    /// a single all-stale burst can be an ACK-blackhole RTO retransmit of
+    /// segment 0, which looks identical to a re-dial until more traffic
+    /// arrives.
+    pub(crate) consecutive_stale_bursts: AtomicU64,
+    /// When the current all-stale streak began (`knet::mono_ms()`), or 0 if
+    /// there is no active streak. Eviction additionally requires the streak
+    /// to span a wall-clock window so a forged burst cannot satisfy the
+    /// count threshold in zero time.
+    pub(crate) first_stale_ms: AtomicU64,
     /// When false, no background input-loop task is spawned: an external
     /// driver (the listener worker pipeline) feeds inbound via
     /// [`KcpStream::feed_raw_batch`].
@@ -368,7 +379,9 @@ impl SharedIoState {
         let mut write = 0usize;
         for read in 0..datagrams.len() {
             let n = datagrams[read].len();
-            let pn = self.transport.decrypt_packet_in_place(&mut datagrams[read], n);
+            let pn = self
+                .transport
+                .decrypt_packet_in_place(&mut datagrams[read], n);
             if pn > 0 {
                 datagrams[read].truncate(pn);
                 if write != read {
@@ -1147,19 +1160,38 @@ pub(crate) fn process_inbound_batch(shared: &SharedIoState, datagrams: &[Vec<u8>
     // mismatched or restarted. A single stale retransmission mixed into fresh
     // data does not.
     let burst = datagrams.len() as u64;
-    if burst > 0
-        && (shared
+    if burst > 0 {
+        let mismatched = shared
             .conv_mismatch
             .load(Ordering::Relaxed)
             .saturating_sub(mismatch_before)
-            >= burst
-            || shared
-                .peer_restart
-                .load(Ordering::Relaxed)
-                .saturating_sub(restart_before)
-                >= burst)
-    {
-        shared.stale_bursts.fetch_add(1, Ordering::Relaxed);
+            >= burst;
+        let restarted = shared
+            .peer_restart
+            .load(Ordering::Relaxed)
+            .saturating_sub(restart_before)
+            >= burst;
+        if mismatched || restarted {
+            shared.stale_bursts.fetch_add(1, Ordering::Relaxed);
+            // Streak bookkeeping for the eviction gate: the first all-stale
+            // burst opens a streak and stamps when it began; every further
+            // all-stale burst extends it. `first_stale_ms == 0` marks "no
+            // active streak".
+            if shared
+                .consecutive_stale_bursts
+                .fetch_add(1, Ordering::Relaxed)
+                == 0
+            {
+                shared
+                    .first_stale_ms
+                    .store(knet::mono_ms(), Ordering::Relaxed);
+            }
+        } else {
+            // Any live datagram breaks the streak — a single all-stale burst
+            // can be an ACK-blackhole RTO of segment 0, not a re-dial.
+            shared.consecutive_stale_bursts.store(0, Ordering::Relaxed);
+            shared.first_stale_ms.store(0, Ordering::Relaxed);
+        }
     }
 
     shared.wait_send.store(ws, Ordering::Relaxed);
@@ -1200,15 +1232,22 @@ pub(crate) fn input_with_optional_conv(
         // for no reason. A stale session fed by the previous generation moved
         // past this floor long ago (observed: thousands).
         // KCP header: conv(4) cmd(1) frg(1) wnd(2) ts(4) sn(4) una(4) len(4).
-        if input.len() >= 20 && kcp.rcv_nxt() >= RESTART_MIN_RCV_NXT {
+        //
+        // Run input FIRST and count a restart only when the packet passed
+        // conv validation (`result.is_ok()`): a 20-byte forged datagram
+        // naming an arbitrary conv would otherwise trip the restart counter.
+        // The conv space is 2^32, so a genuine re-dial colliding with this
+        // session's conv is ~2^-32 — real re-dials almost always arrive as
+        // `ConvMismatch` (and are counted there instead).
+        let result =
+            kcp.input_no_flush_typed(input, regular, shared.acknodelay.load(Ordering::Acquire));
+        if result.is_ok() && input.len() >= 20 && kcp.rcv_nxt() >= RESTART_MIN_RCV_NXT {
             let sn = u32::from_le_bytes(input[12..16].try_into().unwrap_or([0; 4]));
             let una = u32::from_le_bytes(input[16..20].try_into().unwrap_or([0; 4]));
             if sn == 0 && una == 0 {
                 shared.peer_restart.fetch_add(1, Ordering::Relaxed);
             }
         }
-        let result =
-            kcp.input_no_flush_typed(input, regular, shared.acknodelay.load(Ordering::Acquire));
         if matches!(result, Err(crate::kcp::KcpError::ConvMismatch { .. })) {
             shared.conv_mismatch.fetch_add(1, Ordering::Relaxed);
         }

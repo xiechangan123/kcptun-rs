@@ -1,5 +1,13 @@
 //! Zero-allocation encryption/decryption helpers for the kcptun wire format.
 //!
+//! # Authentication (P1-9 / M-11)
+//!
+//! Only `aes-128-gcm` is an AEAD. Every CFB-family cipher (aes, sm4, tea,
+//! xtea, salsa20, blowfish, twofish, cast5, 3des) and `xor` are covered by a
+//! CRC32 only — a network attacker can forge packets. `none`/`null` have no
+//! protection at all. This matches Go kcptun's wire format and cannot change
+//! without breaking compatibility. Prefer `aes-128-gcm` in production.
+//!
 //! The Go kcp-go v5 CFB wire format is:
 //!   `[nonce 16B][CRC32 4B][ciphertext]`
 //!
@@ -217,10 +225,7 @@ impl CryptoBuf {
         out: &mut Vec<Bytes>,
     ) {
         const MIN_TAIL: usize = 4096;
-        let total_wire: usize = packets
-            .iter()
-            .map(|p| CRYPTO_HEADER_SIZE + p.len())
-            .sum();
+        let total_wire: usize = packets.iter().map(|p| CRYPTO_HEADER_SIZE + p.len()).sum();
         self.enc_buf.clear();
         let needed = total_wire.saturating_add(MIN_TAIL);
         if self.enc_buf.capacity() < needed {

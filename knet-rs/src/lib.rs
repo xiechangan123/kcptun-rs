@@ -482,8 +482,11 @@ where
     Ok(s.into_result())
 }
 
-/// Wait for Ctrl-C (SIGINT). Uses a dedicated blocking thread with a libc
-/// signal handler, so it works on both runtimes without tokio::signal.
+/// Wait for Ctrl-C (SIGINT) or SIGTERM. Uses a dedicated blocking thread with
+/// a libc signal handler, so it works on both runtimes without tokio::signal.
+///
+/// SIGTERM is included so `docker stop` / `systemd stop` / k8s termination
+/// trigger the same graceful shutdown as Ctrl-C (Go kcptun handles both).
 pub async fn ctrl_c() -> std::io::Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -491,14 +494,19 @@ pub async fn ctrl_c() -> std::io::Result<()> {
     static INSTALLED: std::sync::Once = std::sync::Once::new();
 
     INSTALLED.call_once(|| {
-        // Install a minimal SIGINT handler that sets a flag.
-        // On non-Unix targets this is a no-op.
+        // Install a minimal SIGINT/SIGTERM handler that sets a flag.
+        // On non-Unix targets this is a no-op (Ctrl-C handling is left to the
+        // platform's default console handler).
         #[cfg(unix)]
         // SAFETY: the installed handler only performs an atomic store. It does
         // not allocate, lock, or perform I/O while running in signal context.
         unsafe {
             libc::signal(
                 libc::SIGINT,
+                sigint_handler as *const () as libc::sighandler_t,
+            );
+            libc::signal(
+                libc::SIGTERM,
                 sigint_handler as *const () as libc::sighandler_t,
             );
         }
@@ -570,3 +578,52 @@ static SIGUSR1_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 
 #[cfg(test)]
 mod tests;
+
+/// In-flight task tracking for graceful shutdown (P1-2 / M-7).
+///
+/// Detached `spawn_task` handles are dropped immediately, so there is no
+/// natural join point when the process is asked to stop: the runtime tears
+/// every task down mid-pipe and the peer sees truncated data. Handlers wrap
+/// their body in [`inflight::guard`]; shutdown calls [`inflight::wait_drain`]
+/// with a grace period before the runtime goes away.
+pub mod inflight {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    /// Number of tracked in-flight tasks.
+    pub fn active() -> usize {
+        COUNT.load(Ordering::Acquire)
+    }
+
+    /// RAII guard: increments on create, decrements on drop (including panic).
+    pub struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            COUNT.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Track one in-flight task until the returned guard drops.
+    pub fn guard() -> Guard {
+        COUNT.fetch_add(1, Ordering::AcqRel);
+        Guard
+    }
+
+    /// Wait up to `timeout` for in-flight tasks to finish.
+    ///
+    /// Returns `true` when the count reached zero, `false` on timeout (the
+    /// caller may then force-cancel whatever is left).
+    pub async fn wait_drain(timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while active() > 0 {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            crate::sleep_ms(25).await;
+        }
+        true
+    }
+}

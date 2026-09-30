@@ -149,6 +149,20 @@ External deps are fetched from crates.io per platform (not vendored). Notable: `
 
 <!-- MANUAL: Any manually added notes below this line are preserved on regeneration -->
 
+## Audit-fix notes (audit-fix/verify)
+
+- **L-4 (RTT only on snd_buf hit) intentionally NOT applied.** Go kcp-go
+  updates `rx_srtt`/`rx_rttvar` on every ACK whose timestamp is ≤ `current`,
+  *before* `parse_ack` — i.e. even for ACKs that miss `snd_buf`. Restricting
+  the sample to hits would diverge RTO behaviour and break Go interop. Needs
+  a dedicated interop check before anyone changes it. Do not re-open as an
+  "unfixed audit item" without that check.
+- **DSCP is a 6-bit field (0–63)** (RFC 2474). Go's own `--help` says
+  `DSCP(6bit)`. Live configs use `--dscp 46` (EF). Values > 63 are rejected
+  at startup; the old silent path wrote `dscp << 2` into `IP_TOS` which
+  overflows u8 for `dscp >= 64`.
+
+
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 

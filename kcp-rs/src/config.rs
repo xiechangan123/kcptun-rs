@@ -101,12 +101,21 @@ impl KCP {
     ///
     /// Does not change `conv`/`token` (fixed at [`KCP::new`]). FEC shard fields
     /// are stored on async [`crate::KcpStream`] builders, not on bare `KCP`.
-    pub fn apply(&mut self, cfg: &KcpConfig) {
-        self.set_mtu(cfg.mtu);
+    ///
+    /// Returns `Err` when a setter rejects the value (P1-4 / M-9): `--mtu 40`
+    /// used to be silently ignored and the session ran with the default MTU.
+    pub fn apply(&mut self, cfg: &KcpConfig) -> Result<(), crate::kcp::KcpError> {
+        if !self.set_mtu(cfg.mtu) {
+            return Err(crate::kcp::KcpError::InvalidConfig(format!(
+                "mtu {} rejected (must be >= 50 and >= KCP header size)",
+                cfg.mtu
+            )));
+        }
         self.set_snd_wnd(cfg.sndwnd);
         self.set_rcv_wnd(cfg.rcvwnd);
         self.set_stream_mode(cfg.stream);
         self.set_mode(cfg.mode, cfg.nodelay, cfg.interval, cfg.resend, cfg.nc);
+        Ok(())
     }
 
     /// Apply a mode profile, or manual nodelay knobs when `mode` is [`KcpMode::Manual`].
@@ -147,7 +156,7 @@ mod tests {
             mtu: 1350,
             ..KcpConfig::default()
         };
-        kcp.apply(&cfg);
+        kcp.apply(&cfg).unwrap();
         assert_eq!(kcp.mtu(), 1350);
         assert_eq!(kcp.snd_wnd(), 128);
         assert_eq!(kcp.interval(), 10);
@@ -159,7 +168,8 @@ mod tests {
         kcp.apply(&KcpConfig {
             mode: KcpMode::Normal,
             ..KcpConfig::default()
-        });
+        })
+        .unwrap();
         assert_eq!(kcp.interval(), 40);
     }
 
@@ -169,7 +179,8 @@ mod tests {
         kcp.apply(&KcpConfig {
             mode: KcpMode::Fast,
             ..KcpConfig::default()
-        });
+        })
+        .unwrap();
         assert_eq!(kcp.interval(), 30);
     }
 
@@ -183,8 +194,30 @@ mod tests {
             resend: 2,
             nc: 1,
             ..KcpConfig::default()
-        });
+        })
+        .unwrap();
         assert_eq!(kcp.interval(), 15);
+    }
+
+    /// P1-4 / M-9: `--mtu 40` must be a hard error, not a silent fallback.
+    #[test]
+    fn apply_rejects_invalid_mtu() {
+        let mut kcp = KCP::new(1, 0, |_| {});
+        let err = kcp
+            .apply(&KcpConfig {
+                mtu: 40,
+                ..KcpConfig::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mtu"), "got: {err}");
+        // A sane MTU still applies.
+        kcp.apply(&KcpConfig {
+            mtu: 1400,
+            ..KcpConfig::default()
+        })
+        .unwrap();
+        assert_eq!(kcp.mtu(), 1400);
     }
 
     #[test]

@@ -497,7 +497,8 @@ impl PeerTransport {
         while offset < packets.len() {
             let sent = {
                 let _guard = self.send_lock.as_ref().map(|l| l.lock_peer(self.peer));
-                self.socket.try_send_batch_to(&packets[offset..], self.peer)?
+                self.socket
+                    .try_send_batch_to(&packets[offset..], self.peer)?
             };
             if sent == 0 {
                 // The kernel send buffer is full. Do NOT wait on the socket's
@@ -574,7 +575,10 @@ mod tests {
         let b = acquire_buf().expect("second drained datagram should be pooled");
         assert!(a.capacity() >= MAX_DATAGRAM);
         assert!(b.capacity() >= MAX_DATAGRAM);
-        assert!(acquire_buf().is_none(), "pool should hold exactly the two drained buffers");
+        assert!(
+            acquire_buf().is_none(),
+            "pool should hold exactly the two drained buffers"
+        );
 
         // A push after mark_closed is refused and its buffer recycled.
         assert!(!q.push(datagram(0xCC), 8));

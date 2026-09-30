@@ -9,9 +9,23 @@
 
 use super::{BlockCrypt, SALT_XOR};
 
-#[derive(Debug)]
 pub struct SimpleXORCrypt {
     key: Vec<u8>,
+}
+
+impl std::fmt::Debug for SimpleXORCrypt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimpleXORCrypt")
+            .field("key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for SimpleXORCrypt {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.key.zeroize();
+    }
 }
 
 impl SimpleXORCrypt {
@@ -85,5 +99,14 @@ mod tests {
         // Test with data larger than key (1500 bytes) to exercise wrap path
         let data = vec![0xABu8; 2000];
         rt(&SimpleXORCrypt::new(b"key"), &mut data.clone());
+    }
+
+    /// P1-6 / L-5: Debug must not print key material.
+    #[test]
+    fn debug_redacts_key() {
+        let c = SimpleXORCrypt::new(b"secret-password");
+        let s = format!("{c:?}");
+        assert!(s.contains("REDACTED"), "got: {s}");
+        assert!(!s.contains("secret-password"), "Debug leaked the key: {s}");
     }
 }

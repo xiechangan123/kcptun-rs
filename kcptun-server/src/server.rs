@@ -114,6 +114,9 @@ pub(crate) fn spawn_session_stream_loop(
             let qpp_key = qpp_key.clone();
             let notify = session.flush_notify();
             knet::spawn_task(async move {
+                // P1-2 / M-7: track the handler so graceful shutdown can wait
+                // for in-flight transfers instead of tearing them mid-pipe.
+                let _inflight = knet::inflight::guard();
                 if let Err(error) = handle_stream(
                     target,
                     stream,

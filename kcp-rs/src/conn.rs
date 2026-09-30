@@ -678,6 +678,16 @@ impl KcpStream {
         self.shared.stale_bursts.load(Ordering::Relaxed)
     }
 
+    /// Consecutive all-stale bursts, reset by any live burst (P0-6 / M-4).
+    pub(crate) fn consecutive_stale_burst_count(&self) -> u64 {
+        self.shared.consecutive_stale_bursts.load(Ordering::Relaxed)
+    }
+
+    /// When the current all-stale streak began (`mono_ms`), or 0 if none.
+    pub(crate) fn first_stale_ms(&self) -> u64 {
+        self.shared.first_stale_ms.load(Ordering::Relaxed)
+    }
+
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.shared.transport.local_addr()
     }
@@ -1167,7 +1177,8 @@ impl KcpStreamBuilder {
             // parity datagrams that actually go out.
             raw_packets_cb.lock().push(data);
         });
-        kcp.apply(&config);
+        kcp.apply(&config)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
         let effective_snd_wnd = kcp.snd_wnd() as usize;
 
         // FEC (header_offset=0): crypto would wrap the whole FEC frame later.
@@ -1218,6 +1229,8 @@ impl KcpStreamBuilder {
             conv_mismatch: AtomicU64::new(0),
             peer_restart: AtomicU64::new(0),
             stale_bursts: AtomicU64::new(0),
+            consecutive_stale_bursts: AtomicU64::new(0),
+            first_stale_ms: AtomicU64::new(0),
             background_input: self.background_input,
             last_activity_ms: AtomicU64::new(knet::mono_ms()),
             last_rx_ms: AtomicU64::new(knet::mono_ms()),
@@ -1433,7 +1446,7 @@ mod tests {
             mtu: 1350,
             ..KcpConfig::default()
         };
-        kcp.apply(&cfg);
+        kcp.apply(&cfg).unwrap();
         assert_eq!(kcp.mtu(), 1350);
         assert_eq!(kcp.snd_wnd(), 128);
         assert_eq!(kcp.interval(), 10);
@@ -1916,6 +1929,98 @@ mod integ {
             before + 1,
             "a burst whose every datagram mismatches must count as stale"
         );
+    }
+
+    /// M-4 rework: a forged 20-byte sn=0/una=0 packet with a WRONG conv
+    /// must not increment `peer_restart` — it must first pass conv
+    /// validation, otherwise an attacker can trip the eviction counter
+    /// with arbitrary bytes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn peer_restart_requires_conv_valid_packet() {
+        use crate::segment::Command;
+
+        let (mut conn_a, mut conn_b) = pair_conns(None).await;
+        roundtrip(&mut conn_a, &mut conn_b, b"establish").await;
+
+        let header = |conv: u32, cmd: u8, sn: u32, una: u32| {
+            let mut d = vec![0u8; 24];
+            d[0..4].copy_from_slice(&conv.to_le_bytes());
+            d[4] = cmd;
+            d[6..8].copy_from_slice(&32u16.to_le_bytes());
+            d[12..16].copy_from_slice(&sn.to_le_bytes());
+            d[16..20].copy_from_slice(&una.to_le_bytes());
+            d
+        };
+
+        let before = conn_b.peer_restart_count();
+        // Wrong conv, sn=0, una=0: forged restart, must NOT count.
+        conn_b.feed_raw_batch(vec![header(0xDEAD_BEEF, Command::Push as u8, 0, 0)]);
+        assert_eq!(
+            conn_b.peer_restart_count(),
+            before,
+            "forged packet with wrong conv must not trip peer_restart"
+        );
+
+        // A burst of many forged packets still must not move the counter.
+        let forged: Vec<Vec<u8>> = (0..10)
+            .map(|_| header(0x1111_2222, Command::Push as u8, 0, 0))
+            .collect();
+        conn_b.feed_raw_batch(forged);
+        assert_eq!(
+            conn_b.peer_restart_count(),
+            before,
+            "forged burst must not accumulate peer_restart"
+        );
+
+        conn_a.close();
+        conn_b.close();
+    }
+
+    /// P0-6 / M-4: eviction needs N *consecutive* all-stale bursts. One
+    /// all-stale burst can be an ACK-blackhole RTO of segment 0 (una=0), which
+    /// is not a re-dial. Any live burst resets the streak.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consecutive_stale_bursts_reset_on_live_traffic() {
+        use crate::segment::Command;
+
+        let (mut conn_a, mut conn_b) = pair_conns(None).await;
+        roundtrip(&mut conn_a, &mut conn_b, b"establish").await;
+
+        let header = |conv: u32, cmd: u8, sn: u32| {
+            let mut d = vec![0u8; 24];
+            d[0..4].copy_from_slice(&conv.to_le_bytes());
+            d[4] = cmd;
+            d[6..8].copy_from_slice(&32u16.to_le_bytes());
+            d[12..16].copy_from_slice(&sn.to_le_bytes());
+            d
+        };
+        let conv = 0xC0FFEE;
+        let foreign = |sn: u32| header(0xDEAD_BEEF, Command::Push as u8, sn);
+        let live = header(conv, Command::Ack as u8, 0);
+
+        // One all-stale burst → consecutive = 1, not yet evictable at N=3.
+        conn_b.feed_raw_batch(vec![foreign(0)]);
+        assert_eq!(conn_b.consecutive_stale_burst_count(), 1);
+
+        // Live traffic resets the streak.
+        conn_b.feed_raw_batch(vec![live.clone()]);
+        assert_eq!(
+            conn_b.consecutive_stale_burst_count(),
+            0,
+            "a live burst must reset the consecutive stale streak"
+        );
+
+        // Two more all-stale bursts after the reset: still only 2.
+        conn_b.feed_raw_batch(vec![foreign(1)]);
+        conn_b.feed_raw_batch(vec![foreign(2)]);
+        assert_eq!(conn_b.consecutive_stale_burst_count(), 2);
+
+        // Third consecutive → reaches the default threshold of 3.
+        conn_b.feed_raw_batch(vec![foreign(3)]);
+        assert_eq!(conn_b.consecutive_stale_burst_count(), 3);
+
+        conn_a.close();
+        conn_b.close();
     }
 
     async fn pair_conns(fec: Option<(u32, u32)>) -> (KcpStream, KcpStream) {

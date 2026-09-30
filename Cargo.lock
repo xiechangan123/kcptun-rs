@@ -849,7 +849,7 @@ dependencies = [
 
 [[package]]
 name = "kcrypt-rs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -864,6 +864,7 @@ dependencies = [
  "sha1",
  "thiserror 2.0.18",
  "twofish",
+ "zeroize",
 ]
 
 [[package]]
@@ -1470,7 +1471,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "smux-rs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "clap",
@@ -1897,6 +1898,12 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "zeroize"
+version = "1.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
 
 [[package]]
 name = "zmij"

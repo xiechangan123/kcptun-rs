@@ -18,7 +18,7 @@ fn normalize_go_alias(arg: std::ffi::OsString) -> std::ffi::OsString {
 /// signed `i64`; count/window/size fields are unsigned and cannot be negative.
 /// Negatives are clamped to zero when applied to the KCP/SMUX config.
 #[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct Config {
     pub localaddr: Option<String>,
     pub remoteaddr: Option<String>,
@@ -56,6 +56,8 @@ pub(crate) struct Config {
     pub quiet: Option<bool>,
     pub tcp: Option<bool>,
     pub pprof: Option<bool>,
+    /// pprof bind address (same semantics as `--pprofaddr`).
+    pub pprofaddr: Option<String>,
     #[cfg(feature = "qpp")]
     pub qpp: Option<bool>,
     #[cfg(feature = "qpp")]
@@ -89,6 +91,8 @@ pub(crate) struct Cli {
 
     /// Encryption method: null, none, xor, aes, aes-128, aes-192, aes-256,
     /// sm4, tea, xtea, salsa20, blowfish, twofish, cast5, 3des, aes-128-gcm.
+    /// Only aes-128-gcm is authenticated — prefer it for production. The CFB
+    /// family is CRC32-only (forgeable). xor/none/null are debug-only.
     #[arg(long, default_value = "aes")]
     pub crypt: Option<String>,
 
@@ -96,7 +100,8 @@ pub(crate) struct Cli {
     #[arg(short, long, default_value = "fast")]
     pub mode: Option<String>,
 
-    /// Number of UDP connections to use.
+    /// Number of UDP connections to use (1–256). Values above 256 are
+    /// rejected at startup: each conn is a session + task + socket.
     #[arg(long)]
     pub conn: Option<u32>,
 
@@ -224,9 +229,16 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
     pub tcp: bool,
 
-    /// Enable pprof HTTP server on :6060 (matching Go kcptun).
+    /// Enable pprof HTTP server (binds `--pprofaddr`, loopback by default).
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
     pub pprof: bool,
+
+    /// Bind address for the pprof HTTP server. Defaults to loopback: the
+    /// profile endpoint exposes process internals and must not face the
+    /// network. Use `--pprofaddr 0.0.0.0:6060` to restore Go kcptun's
+    /// all-interfaces bind.
+    #[arg(long, default_value = "127.0.0.1:6060")]
+    pub pprofaddr: String,
 
     /// Enable QPP encryption.
     #[cfg(feature = "qpp")]
@@ -291,6 +303,7 @@ impl Cli {
             quiet: cfg.quiet.unwrap_or(cli.quiet),
             tcp: cfg.tcp.unwrap_or(cli.tcp),
             pprof: cfg.pprof.unwrap_or(cli.pprof),
+            pprofaddr: cfg.pprofaddr.unwrap_or(cli.pprofaddr),
             #[cfg(feature = "qpp")]
             qpp: cfg.qpp.unwrap_or(cli.qpp),
             #[cfg(feature = "qpp")]
@@ -303,22 +316,52 @@ impl Cli {
 
 #[cfg(test)]
 mod tests {
+
+    /// M-6 rework: client JSON must reject unknown fields too.
+    #[test]
+    fn client_json_rejects_unknown_fields() {
+        assert!(
+            serde_json::from_str::<Config>(r#"{"mmtu":1350}"#).is_err(),
+            "misspelled client fields must fail fast"
+        );
+        assert!(serde_json::from_str::<Config>(r#"{"mtu":1350}"#).is_ok());
+    }
+
     use super::*;
 
     #[test]
-    fn json_false_overrides_cli_true_and_unknown_fields_are_ignored() {
+    fn json_false_overrides_cli_true_and_unknown_fields_are_rejected() {
         let cli = Cli::try_parse_from(["kcptun-client", "--tcp", "--nocomp", "--quiet", "--pprof"])
             .unwrap();
-        let cfg: Config = serde_json::from_str(
-            r#"{"tcp":false,"nocomp":false,"quiet":false,"pprof":false,"future":1}"#,
-        )
-        .unwrap();
+        // M-6 rework: deny_unknown_fields — a typo like "mmtu" must fail
+        // at startup instead of being silently ignored.
+        assert!(
+            serde_json::from_str::<Config>(r#"{"mmtu":1350}"#).is_err(),
+            "misspelled client fields must fail fast"
+        );
+        let cfg: Config =
+            serde_json::from_str(r#"{"tcp":false,"nocomp":false,"quiet":false,"pprof":false}"#)
+                .unwrap();
 
         let merged = Cli::merge(cli, cfg);
         assert!(!merged.tcp);
         assert!(!merged.nocomp);
         assert!(!merged.quiet);
         assert!(!merged.pprof);
+    }
+
+    /// pprofaddr: JSON overrides CLI default (loopback).
+    #[test]
+    fn json_pprofaddr_overrides_cli_default() {
+        let cli = Cli::try_parse_from(["kcptun-client", "-r", "1.2.3.4:29900"]).unwrap();
+        let cfg: Config = serde_json::from_str(r#"{"pprofaddr": "10.0.0.1:7070"}"#).unwrap();
+        let merged = Cli::merge(cli, cfg);
+        assert_eq!(merged.pprofaddr, "10.0.0.1:7070");
+
+        let cli = Cli::try_parse_from(["kcptun-client", "-r", "1.2.3.4:29900"]).unwrap();
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        let merged = Cli::merge(cli, cfg);
+        assert_eq!(merged.pprofaddr, "127.0.0.1:6060");
     }
 
     #[test]

@@ -8,9 +8,23 @@
 
 use super::{cfb8_decrypt, cfb8_encrypt, BlockCipher8, BlockCrypt};
 
-#[derive(Debug)]
 pub struct XteaCrypt {
     table: [u32; 64],
+}
+
+impl std::fmt::Debug for XteaCrypt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("XteaCrypt")
+            .field("table", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for XteaCrypt {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.table.zeroize();
+    }
 }
 
 impl XteaCrypt {

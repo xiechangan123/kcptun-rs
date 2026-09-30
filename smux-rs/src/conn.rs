@@ -643,6 +643,7 @@ mod tests {
             max_frame_size: 4096,
             keepalive_interval: 5,
             keepalive_timeout: 20,
+            ..DEFAULT_CONFIG.clone()
         });
         assert!(!b2.is_client);
         assert_eq!(b2.config.version, 2);

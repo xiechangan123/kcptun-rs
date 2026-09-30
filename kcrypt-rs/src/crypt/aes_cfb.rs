@@ -68,13 +68,29 @@ fn has_hw_aes() -> bool {
     }
 }
 
-#[derive(Debug)]
 pub struct AesCfbCrypt {
     cipher: AesCipher,
     cipher_name: &'static str,
     /// Cached `E(GO_CFB_IV)` — the first CFB-128 keystream block, constant per
     /// key. Saves one block-cipher call per packet (encrypt and decrypt).
     first_keystream: [u8; 16],
+}
+
+impl std::fmt::Debug for AesCfbCrypt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Type name only: `first_keystream` decrypts the first plaintext
+        // block of every packet, which is as good as the key itself.
+        f.write_str("AesCfbCrypt { .. }")
+    }
+}
+
+impl Drop for AesCfbCrypt {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.first_keystream.zeroize();
+        // The AES key schedule inside `cipher` is not extractable
+        // field-by-field, so it cannot be zeroized here.
+    }
 }
 
 impl AesCfbCrypt {
